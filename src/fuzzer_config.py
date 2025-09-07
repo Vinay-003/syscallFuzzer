@@ -1,302 +1,184 @@
-# fuzzer_config.py
-# Improved, safety-first generator "brain" for syscall_fuzzing_framework
-# - stateful resource pool (fd/mmap/socket hints)
-# - focused edge-case integer families
-# - deterministic seed handling helpers
-# - crash metadata helper (safe: only stores metadata & logs)
-#
-# IMPORTANT: This file intentionally avoids offering "exploit" sequences.
-# It improves coverage & triage for responsible fuzzing in controlled labs.
-
-import os
 import random
+import os
 import time
-import json
-import hashlib
 
-# ---------------------------
-# Basic constants (safe)
-# ---------------------------
-# Protections / flags for mmap-like placeholders (not exploit payloads)
-PROT_READ, PROT_WRITE, PROT_EXEC = 0x1, 0x2, 0x4
-MAP_SHARED, MAP_PRIVATE, MAP_ANONYMOUS, MAP_POPULATE = 0x01, 0x02, 0x20, 0x008000
+# A collection of "interesting" values to be used by generators.
+INTERESTING_VALUES = {
+    "int": [-1, 0, 1, 2, 64, 1024, 4096, 0x7FFFFFFF, 0xFFFFFFFF],
+    "flags": [0, 1, 2, 0x80000000, 0xFFFFFFFF],
+    "pid": [-1, 0, 1, 2],
+    "mode": [0o777, 0o644, 0o600, 0o755, 0],
+}
 
-# ptrace
-PTRACE_TRACEME = 0
+# --- Argument Type Generators ---
+# These functions generate values for specific argument types.
 
-# seccomp
-SECCOMP_SET_MODE_FILTER = 1
+def gen_random_int(arg_spec=None):
+    """Generates a completely random 32-bit integer."""
+    return random.randint(-2**31, 2**31 - 1)
 
-# userfaultfd flags
-O_CLOEXEC, O_NONBLOCK = 0x80000, 0x800
+def gen_fd(arg_spec=None):
+    """Generates a file descriptor, prioritizing interesting values."""
+    return random.choice(INTERESTING_VALUES["int"] + [-1, 0, 1, 2])
 
-# mount
-MS_MOVE = 4096
+def gen_addr(arg_spec=None):
+    """Generates a memory address, prioritizing NULL and page boundaries."""
+    return random.choice([0, 0x1000, 0x80000000, 0xC0000000, gen_random_int()])
 
-# unshare flags
-CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER = 0x00020000, 0x20000000, 0x10000000
+def gen_size(arg_spec=None):
+    """Generates a size value."""
+    return random.choice(INTERESTING_VALUES["int"] + [16, 128, 512, 4096])
 
-# socket domains/types
-AF_INET, AF_INET6, AF_UNIX, AF_NETLINK = 2, 10, 1, 16
-SOCK_STREAM, SOCK_DGRAM, SOCK_RAW = 1, 2, 3
+def gen_pid(arg_spec=None):
+    """Generates a process ID."""
+    return random.choice(INTERESTING_VALUES["pid"])
 
-# keyctl
-KEYCTL_GET_KEYRING_ID = 0
+def gen_mode(arg_spec=None):
+    """Generates a file permission mode."""
+    return random.choice(INTERESTING_VALUES["mode"])
 
-# ---------------------------
-# ResourcePool: stateful hints for sequences
-# ---------------------------
-class ResourcePool:
-    """
-    Tracks synthetic resource hints (fd/mmap/socket ids) so generated sequences
-    are stateful and more realistic. The executor should map these hints to
-    actual in-VM resources when executing.
-    """
-    def __init__(self):
-        self.fds = []          # synthetic fd hints
-        self.sockets = []      # synthetic socket ids
-        self.mmaps = {}        # id -> (addr, size)
-        self._next_fd = 100
-        self._next_sock = 200
+# --- CVE & Subsystem Specific Generators ---
 
-    def new_fd(self):
-        fd = self._next_fd
-        self._next_fd += 1
-        self.fds.append(fd)
-        return fd
+def gen_mmap_flags_cve(arg_spec=None):
+    """Generates flags relevant to mmap."""
+    base_flags = [0x1, 0x2, 0x10] # MAP_SHARED, MAP_PRIVATE, MAP_ANONYMOUS
+    return random.choice(base_flags) | random.choice(INTERESTING_VALUES["flags"])
 
-    def sample_fd(self):
-        # 40% create new, else reuse
-        if (not self.fds) or random.random() < 0.4:
-            return self.new_fd()
-        return random.choice(self.fds)
+def gen_ptrace_req_cve(arg_spec=None):
+    """Generates ptrace requests, including PTRACE_TRACEME."""
+    return 0 # PTRACE_TRACEME
 
-    def new_socket(self):
-        s = self._next_sock
-        self._next_sock += 1
-        self.sockets.append(s)
-        return s
+def gen_userfaultfd_flags(arg_spec=None):
+    """Generates flags for userfaultfd."""
+    return random.choice([0, 1, 4]) # O_CLOEXEC, O_NONBLOCK
 
-    def sample_socket(self):
-        if (not self.sockets) or random.random() < 0.4:
-            return self.new_socket()
-        return random.choice(self.sockets)
+def gen_seccomp_flags(arg_spec=None):
+    """Generates flags for seccomp."""
+    return random.choice([0, 1, 2]) # SECCOMP_MODE_STRICT, SECCOMP_MODE_FILTER
 
-    def new_mmap(self, size):
-        mid = len(self.mmaps) + 1
-        # store page-aligned hint address
-        page = 4096
-        addr = page * (100 + mid)
-        self.mmaps[mid] = (addr, size)
-        return mid, addr
+def gen_ioctl_request(arg_spec=None):
+    """Generates a pseudo-random ioctl request code."""
+    return random.choice([0x5401, 0x5413, gen_random_int()])
 
-    def sample_mmap(self):
-        if (not self.mmaps) or random.random() < 0.5:
-            # create a new small mmap hint
-            mid, addr = self.new_mmap(4096)
-            return mid, addr, 4096
-        mid = random.choice(list(self.mmaps.keys()))
-        addr, size = self.mmaps[mid]
-        return mid, addr, size
+def gen_bpf_cmd(arg_spec=None):
+    """Generates a command for the bpf syscall."""
+    return random.randint(0, 15)
 
-# create global pool instance for use by generators
-res_pool = ResourcePool()
+def gen_keyctl_cmd(arg_spec=None):
+    """Generates a command for keyctl."""
+    return random.randint(0, 20)
 
-# ---------------------------
-# Focused "edge-case" families for ints / addrs / sizes
-# ---------------------------
-PAGE = 4096
+def gen_socket_domain(arg_spec=None):
+    """Generates a socket domain."""
+    return random.choice([2, 10, 1, 16]) # AF_INET, AF_INET6, AF_UNIX, AF_NETLINK
 
-def gen_edge_int():
-    """Prefer meaningful small/large/page-aligned edge values instead of random 64-bit."""
-    edge_choices = [
-        0, 1, 2, -1,
-        2**31 - 1, 2**32 - 1, 2**63 - 1,
-        PAGE, PAGE - 1, PAGE + 1, PAGE * 100,
-        0xfffffffffffffffe, 0xffffffffffffffff
-    ]
-    if random.random() < 0.3:
-        return random.choice(edge_choices)
-    # small random value most of the time
-    return random.randint(0, 4096)
+def gen_socket_type(arg_spec=None):
+    """Generates a socket type."""
+    return random.choice([1, 2, 3]) # SOCK_STREAM, SOCK_DGRAM, SOCK_RAW
 
-def gen_addr():
-    """Address generator using page-aligned and sentinel addresses (hints)."""
-    if random.random() < 0.4:
-        # use a synthetic mmap hint
-        _, addr = res_pool.new_mmap(4096)
-        return addr
-    return random.choice([0, 0xffffffffffffffff, 0xdeadbeef, PAGE, PAGE*256, gen_edge_int()])
-
-def gen_size():
-    """Size generator with common edge sizes."""
-    return random.choice([0, 1, PAGE, PAGE - 1, PAGE + 1, 2**16, 2**20, 2**32 - 1, gen_edge_int()])
-
-def gen_flags():
-    """Generic flags (narrowed)."""
-    candidates = [0, PROT_READ, PROT_WRITE, PROT_EXEC,
-                  PROT_READ | PROT_WRITE, MAP_PRIVATE, MAP_SHARED, MAP_POPULATE]
-    if random.random() < 0.15:
-        return random.randint(0, 0xffff)
-    return random.choice(candidates)
-
-# ---------------------------
-# Specific CVE-targeted (non-exploit) helpers (kept minimal)
-# ---------------------------
-def gen_mmap_flags_cve_2024_39497():
-    # targeted combination used in research — keep as a possible choice, not a script
-    return PROT_WRITE | MAP_PRIVATE
-
-def gen_ptrace_request_cve_2019_13272():
-    return PTRACE_TRACEME
-
-def gen_mount_flags_move():
-    return MS_MOVE
-
-def gen_unshare_flags_ns():
-    return random.choice([CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWNS | CLONE_NEWPID])
-
-def gen_seccomp_flags():
-    return SECCOMP_SET_MODE_FILTER
-
-def gen_userfaultfd_flags():
-    return random.choice([0, O_CLOEXEC, O_NONBLOCK, O_CLOEXEC | O_NONBLOCK])
-
-# ---------------------------
-# Socket / ioctl / bpf / keyctl generators
-# ---------------------------
-def gen_socket_domain():
-    return random.choice([AF_INET, AF_INET6, AF_UNIX, AF_NETLINK, -1])
-
-def gen_socket_type():
-    return random.choice([SOCK_STREAM, SOCK_DGRAM, SOCK_RAW, 0, 10])
-
-def gen_ioctl_request():
-    # driver-specific; we return bounded randoms to avoid extreme values
-    return random.randint(0, 0xffff)
-
-def gen_bpf_command():
-    return random.choice([0, 5, -1])
-
-def gen_keyctl_command():
-    return KEYCTL_GET_KEYRING_ID
-
-# ---------------------------
-# Resource-aware fd generator wrapper
-# ---------------------------
-def gen_fd():
-    """Return a synthetic fd hint (the executor should map hints to real fds)."""
-    if random.random() < 0.4:
-        return res_pool.sample_fd()
-    # occasional "special" FDs
-    return random.choice([-1, 0, 1, 2, res_pool.sample_fd()])
-
-# ---------------------------
-# Mapping types to generator functions (used by executor harness)
-# ---------------------------
+# Mapping of type names to generator functions
 TYPE_GENERATORS = {
+    "random_int": gen_random_int,
     "fd": gen_fd,
     "addr": gen_addr,
     "size": gen_size,
-    "flags": gen_flags,
-    "mmap_flags_cve": gen_mmap_flags_cve_2024_39497,
-    "ptrace_req_cve": gen_ptrace_request_cve_2019_13272,
-    "mount_flags_move": gen_mount_flags_move,
-    "unshare_flags_ns": gen_unshare_flags_ns,
-    "seccomp_flags": gen_seccomp_flags,
+    "flags": lambda spec: random.choice(INTERESTING_VALUES["flags"]),
+    "pid": gen_pid,
+    "mode": gen_mode,
+    "mmap_flags_cve": gen_mmap_flags_cve,
+    "ptrace_req_cve": gen_ptrace_req_cve,
     "userfaultfd_flags": gen_userfaultfd_flags,
+    "seccomp_flags": gen_seccomp_flags,
+    "ioctl_request": gen_ioctl_request,
+    "bpf_cmd": gen_bpf_cmd,
+    "keyctl_cmd": gen_keyctl_cmd,
     "socket_domain": gen_socket_domain,
     "socket_type": gen_socket_type,
-    "ioctl_request": gen_ioctl_request,
-    "bpf_cmd": gen_bpf_command,
-    "keyctl_cmd": gen_keyctl_command,
 }
 
-# ---------------------------
-# Syscall specs & high-level sequences (templates)
-# These are *templates* and not "exploit recipes".
-# ---------------------------
+# --- Syscall Definitions ---
+# This dictionary defines the syscalls we want to fuzz and their arguments.
 SYSCALL_SPECS = {
-    "read": ["fd", "addr", "size"],
-    "write": ["fd", "addr", "size"],
-    "open": ["addr", "flags"],
-    "close": ["fd"],
-    "mmap": ["addr", "size", "mmap_flags_cve", "fd", "size"],
-    "ptrace": ["ptrace_req_cve", "size", "addr", "addr"],
-    "userfaultfd": ["userfaultfd_flags"],
-    "seccomp": ["seccomp_flags", "flags", "addr"],
+    # Tier 1: High-Impact Memory Corruption
+    "setsockopt": ["fd", "random_int", "random_int", "addr", "size"],
+    "getsockopt": ["fd", "random_int", "random_int", "addr", "addr"],
     "ioctl": ["fd", "ioctl_request", "addr"],
     "bpf": ["bpf_cmd", "addr", "size"],
+    "socket": ["socket_domain", "socket_type", "flags"],
+    "connect": ["fd", "addr", "size"],
+    "accept": ["fd", "addr", "addr"],
+    "bind": ["fd", "addr", "size"],
+    "listen": ["fd", "random_int"],
+    "sendto": ["fd", "addr", "size", "flags", "addr", "size"],
+    "recvfrom": ["fd", "addr", "size", "flags", "addr", "addr"],
+
+    # Tier 2: Privilege Escalation & Concurrency
+    "mount": ["addr", "addr", "addr", "flags", "addr"],
+    "chown": ["addr", "random_int", "random_int"],
+    "chmod": ["addr", "mode"],
+    "init_module": ["addr", "size", "addr"],
+    "finit_module": ["fd", "addr", "flags"],
+    "unshare": ["flags"],
+
+    # Tier 3: Environment-Specific & Advanced Targets
+    "openat": ["fd", "addr", "flags", "mode"],
+    "unlinkat": ["fd", "addr", "flags"],
+    "renameat": ["fd", "addr", "fd", "addr"],
+    "setuid": ["pid"],
+    "setgid": ["pid"],
+    "capset": ["addr", "addr"],
+    "mmap": ["addr", "size", "flags", "fd", "size"],
+    "ptrace": ["ptrace_req_cve", "pid", "addr", "addr"],
+
+    # General Purpose & High Frequency
+    "read": ["fd", "addr", "size"],
+    "write": ["fd", "addr", "size"],
+    "open": ["addr", "flags", "mode"],
+    "close": ["fd"],
+    "lseek": ["fd", "random_int", "random_int"],
+    "pread64": ["fd", "addr", "size", "random_int"],
+    "pwrite64": ["fd", "addr", "size", "random_int"],
+    "dup": ["fd"],
+    "dup2": ["fd", "fd"],
+    "stat": ["addr", "addr"],
+    "fstat": ["fd", "addr"],
+    "unlink": ["addr"],
+    "rename": ["addr", "addr"],
+    "fork": [],
+    "vfork": [],
+    "clone": ["flags", "addr", "addr", "addr", "addr"],
+    "execve": ["addr", "addr", "addr"],
+    "exit": ["random_int"],
+    "wait4": ["pid", "addr", "flags", "addr"],
+    "kill": ["pid", "random_int"],
+    "tgkill": ["pid", "pid", "random_int"],
+    "userfaultfd": ["userfaultfd_flags"],
+    "seccomp": ["seccomp_flags", "flags", "addr"],
     "io_uring_setup": ["size", "addr"],
     "keyctl": ["keyctl_cmd", "flags", "size", "addr"],
-    "socket": ["socket_domain", "socket_type", "flags"],
-    "setsockopt": ["fd", "flags", "flags", "addr", "size"],
 }
 
-# These sequences are safe templates for exercising stateful code paths.
+# --- Syscall Sequences ---
+# Sequences allow multi-step tests with dependency between calls.
+# If a step has "result": "fd1", the executor return value is stored as env["fd1"].
+# Later steps can use {"value": "fd1"} to substitute it into args.
 SYSCALL_SEQUENCES = {
-    "move_mount_template": [
-        {"name": "unshare", "args": ["unshare_flags_ns"]},
-        {"name": "mount", "args": ["addr", "addr", "addr", "mount_flags_move", "addr"]},
+    "uaf_double_close": [
+        {"action": "open", "args": ["addr", "flags", "mode"], "result": "fd1"},
+        {"action": "close", "args": [{"value": "fd1"}]},
+        {"action": "close", "args": [{"value": "fd1"}]}
     ],
-    "seccomp_then_ptrace_template": [
-        {"name": "seccomp", "args": ["seccomp_flags", "flags", "addr"]},
-        {"name": "ptrace", "args": ["ptrace_req_cve", "size", "addr", "addr"]},
+    "uaf_use_after_close": [
+        {"action": "open", "args": ["addr", "flags", "mode"], "result": "fd1"},
+        {"action": "close", "args": [{"value": "fd1"}]},
+        {"action": "write", "args": [{"value": "fd1"}, "addr", "size"]}
     ],
-    "socket_template": [
-        {"name": "socket", "args": ["socket_domain", "socket_type", "flags"]},
-        {"name": "setsockopt", "args": ["fd", "flags", "flags", "addr", "size"]},
+    "move_mount_panic": [
+        {"action": "unshare", "args": ["flags"]},
+        {"action": "mount", "args": ["addr", "addr", "addr", "flags", "addr"]},
     ],
+    "seccomp_ptrace_bypass_test": [
+       {"action": "seccomp", "args": ["seccomp_flags", "flags", "addr"]},
+       {"action": "ptrace", "args": ["ptrace_req_cve", "pid", "addr", "addr"]},
+    ]
 }
-
-# ---------------------------
-# Deterministic seed helpers & crash metadata (safe)
-# ---------------------------
-def get_seed():
-    """Return seed from env (FUZZ_SEED) or create one and store it."""
-    s = os.environ.get("FUZZ_SEED")
-    if s:
-        try:
-            return int(s)
-        except Exception:
-            pass
-    # default: time-based but still reproducible if printed and re-used
-    seed = int(time.time() * 1000) & 0xffffffff
-    return seed
-
-def compute_run_id(seq_repr, seed):
-    """Return a short id for a testcase (sha256 of seed+seq)."""
-    h = hashlib.sha256()
-    h.update(str(seed).encode())
-    h.update(seq_repr.encode())
-    return h.hexdigest()[:16]
-
-def save_crash_meta(crash_dir, seq_repr, seed, extra_logs=None):
-    """
-    Save crash metadata to crash_dir:
-      - seed, timestamp, short id
-      - short excerpt of logs (if provided)
-    Note: This function never transmits or executes anything; it only stores metadata.
-    """
-    meta = {
-        "seed": seed,
-        "timestamp": int(time.time()),
-        "seq": seq_repr,
-    }
-    runid = compute_run_id(seq_repr, seed)
-    meta_path = os.path.join(crash_dir, f"meta_{runid}.json")
-    # include small excerpt of logs if available
-    if extra_logs:
-        meta["log_excerpt"] = extra_logs[:4096]
-    # atomic write
-    tmp = meta_path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(meta, f, indent=2)
-    os.replace(tmp, meta_path)
-    return runid
-
-# Expose a small API for external code
-__all__ = [
-    "TYPE_GENERATORS", "SYSCALL_SPECS", "SYSCALL_SEQUENCES",
-    "res_pool", "get_seed", "compute_run_id", "save_crash_meta"
-]

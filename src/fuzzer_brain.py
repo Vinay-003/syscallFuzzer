@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """
-fuzzer_brain.py - Finalized version
+fuzzer_brain.py - Enhanced Finalized Version
 
 Controls a QEMU Alpine VM, transfers & compiles executor.c inside the VM,
 generates syscall calls from fuzzer_config, runs them via SSH, and logs crashes.
 
-Usage:
-  - Ensure qemu, sshpass, gcc are available on host and openssh was installed in the VM.
-  - Configure VM_* constants below if needed.
-  - Run: python3 fuzzer_brain.py
+Enhancements:
+ - Parse executor output ("syscall(N) = <ret>") and capture return values.
+ - Store results in env when "result" key is present in sequence steps.
+ - Resolve {"value":"fd1"} placeholders in args using stored env.
 """
 
 import subprocess
 import time
 import os
 import random
+import re
 from datetime import datetime
 import json
 import signal
@@ -29,7 +30,7 @@ VM_DISK_IMAGE = "../alpine.qcow2"
 VM_RAM = "1G"
 HOST_SSH_PORT = "10022"        # host port forwarded to VM's 22
 VM_USER = "root"
-VM_PASSWORD = "123"           # set to the password you chose during setup
+VM_PASSWORD = "123"            # set to the password you chose during setup
 EXECUTOR_SOURCE_PATH = "executor.c"
 EXECUTOR_VM_PATH = "/root/executor"
 CRASHES_DIR = "crashes"
@@ -40,6 +41,9 @@ QEMU_COMMAND = [
     "-netdev", f"user,id=net0,hostfwd=tcp::{HOST_SSH_PORT}-:22",
     "-device", "e1000,netdev=net0", "-enable-kvm"
 ]
+
+# Regex for parsing executor output
+RE_SYSCALL_RET = re.compile(r"syscall\((\d+)\)\s*=\s*(-?\d+)")
 
 # -----------------------
 # Helper: shell/ssh utilities
@@ -139,7 +143,7 @@ def start_and_wait_for_vm():
         if check_ssh_ready():
             print("[+] SSH port open; validating in-VM responsiveness...")
             # small wait for SSH service
-            time.sleep(3)
+            time.sleep(10)
             # Try a simple echo command
             retry_timeout = 30
             retry_start = time.time()
@@ -148,7 +152,7 @@ def start_and_wait_for_vm():
                 if res is not None and "SSH_OK" in (res.stdout or ""):
                     print("[+] VM is responsive via SSH.")
                     return vm_process
-                time.sleep(2)
+                time.sleep(3)
             print("[!] VM started but SSH did not respond to commands in time.")
             vm_process.terminate()
             return None
@@ -159,7 +163,7 @@ def start_and_wait_for_vm():
     return None
 
 # -----------------------
-# Crash logging (preserve your prior format)
+# Crash logging
 # -----------------------
 def log_crash(reproducer_command, extra_files=None):
     """Save a crash report and attempt to fetch dmesg/serial logs from VM."""
@@ -184,22 +188,18 @@ def log_crash(reproducer_command, extra_files=None):
         else:
             f.write(str(reproducer_command) + "\n")
 
-    # Attempt to capture dmesg and serial logs from VM (best-effort)
+    # Attempt to capture dmesg and serial logs from VM
     try:
-        # inside VM: write dmesg to a file
         run_command_in_vm(f"dmesg -T > /root/last_dmesg.txt", suppress_errors=True, timeout=15)
-        # attempt to fetch it
         fetch_file_from_vm("/root/last_dmesg.txt", os.path.join(base_path, "last_dmesg.txt"))
     except Exception as e:
         print(f"[!] Failed to capture/pull dmesg: {e}")
 
     try:
-        # If you maintain a serial log inside VM at /root/serial.log, try to fetch it
         fetch_file_from_vm("/root/serial.log", os.path.join(base_path, "serial.log"))
     except Exception:
         pass
 
-    # Save any extra files passed in
     if extra_files:
         for name, content in extra_files.items():
             try:
@@ -211,24 +211,53 @@ def log_crash(reproducer_command, extra_files=None):
     print(f"[+] All saved under: {base_path}")
 
 # -----------------------
+# Parsing + argument resolution
+# -----------------------
+def parse_executor_output(stdout):
+    """Parse executor output for return value (int) if available."""
+    if not stdout:
+        return None
+    m = RE_SYSCALL_RET.search(stdout)
+    if m:
+        try:
+            return int(m.group(2))
+        except Exception:
+            return None
+    return None
+
+def resolve_arg(arg_spec, env):
+    """
+    Resolve argument spec into a concrete value string.
+    - {"value":"fd1"} -> env lookup
+    - type string -> generator
+    - fallback -> literal string/number
+    """
+    if isinstance(arg_spec, dict) and "value" in arg_spec:
+        return str(env.get(arg_spec["value"], 0))
+    if isinstance(arg_spec, str):
+        if arg_spec in env:
+            return str(env[arg_spec])
+        gen = TYPE_GENERATORS.get(arg_spec)
+        if gen:
+            try:
+                return str(gen())
+            except Exception:
+                return "0"
+        return arg_spec
+    return str(arg_spec)
+
+# -----------------------
 # Fuzzing logic
 # -----------------------
 def gen_random_syscall():
     """Pick a syscall and generate args using TYPE_GENERATORS."""
     name = random.choice(list(SYSCALL_SPECS.keys()))
     arg_types = SYSCALL_SPECS[name]
-    args = []
-    for t in arg_types:
-        gen = TYPE_GENERATORS.get(t)
-        try:
-            val = gen()
-        except Exception:
-            val = 0
-        args.append(str(val))
+    args = [resolve_arg(t, {}) for t in arg_types]
     return name, args
 
 def run_fuzzing_session(vm_process):
-    """Main fuzzing loop that runs until a crash is detected or user stops it."""
+    """Main fuzzing loop until crash or stop."""
     print("\n" + "="*50)
     print(" " * 15 + "STARTING FUZZING SESSION")
     print("="*50)
@@ -239,46 +268,38 @@ def run_fuzzing_session(vm_process):
             iteration += 1
             print(f"\n--- Iteration #{iteration} ---")
 
-            # Choose to fuzz a single syscall or a predefined sequence
             if random.random() < 0.5 and SYSCALL_SPECS:
                 # Single syscall
-                print("[+] Fuzzing a single targeted syscall...")
                 syscall_name, args = gen_random_syscall()
                 command_to_run = f"{EXECUTOR_VM_PATH} {syscall_name} {' '.join(args)}"
                 res = run_command_in_vm(command_to_run)
                 if res is None:
-                    # crash or VM unresponsive detected
                     log_crash(command_to_run)
                     return False
+                ret = parse_executor_output(res.stdout)
+                print(f"[+] Return value: {ret}")
             elif SYSCALL_SEQUENCES:
-                # Sequence of syscalls (template)
-                print("[+] Fuzzing a syscall sequence...")
+                # Sequence with env + placeholders
                 sequence_name, steps = random.choice(list(SYSCALL_SEQUENCES.items()))
-                print(f"   [+] Selected sequence: {sequence_name}")
-
-                full_sequence_commands = []
+                print(f"[+] Fuzzing sequence: {sequence_name}")
+                env = {}
+                full_sequence = []
                 for step in steps:
-                    name = step["name"]
-                    arg_types = step["args"]
-                    args = []
-                    for t in arg_types:
-                        gen = TYPE_GENERATORS.get(t, lambda: 0)
-                        try:
-                            args.append(str(gen()))
-                        except Exception:
-                            args.append("0")
+                    name = step.get("action") or step.get("name")
+                    args = [resolve_arg(a, env) for a in step.get("args", [])]
                     command_to_run = f"{EXECUTOR_VM_PATH} {name} {' '.join(args)}"
-                    full_sequence_commands.append(command_to_run)
-
+                    full_sequence.append(command_to_run)
                     res = run_command_in_vm(command_to_run)
                     if res is None:
-                        # Save the commands that lead to crash
-                        log_crash(full_sequence_commands)
+                        log_crash(full_sequence)
                         return False
+                    ret = parse_executor_output(res.stdout)
+                    if step.get("result"):
+                        env[step["result"]] = ret if ret is not None else 0
+                        print(f"    [env] {step['result']} = {env[step['result']]}")
                 print("   [+] Sequence completed successfully.")
             else:
                 print("[!] No syscall specs/sequences found. Sleeping briefly.")
-            # a small delay to avoid hammering the VM too quickly
             time.sleep(0.1)
     except KeyboardInterrupt:
         print("\n[!] Fuzzing session interrupted by user.")
@@ -288,55 +309,33 @@ def run_fuzzing_session(vm_process):
 # Main control flow
 # -----------------------
 def main():
-    print("[*] Fuzzer starting. Setting deterministic seed (optional via FUZZ_SEED).")
-    seed_env = os.environ.get("FUZZ_SEED")
-    if seed_env:
-        try:
-            seed_val = int(seed_env)
-        except Exception:
-            seed_val = int(time.time() * 1000) & 0xffffffff
-    else:
-        seed_val = int(time.time() * 1000) & 0xffffffff
+    print("[*] Fuzzer starting with seed.")
+    seed_val = int(time.time() * 1000) & 0xffffffff
     random.seed(seed_val)
     print(f"[+] Seed: {seed_val}")
 
-    print("[*] Starting VM for setup check...")
     vm_process = start_and_wait_for_vm()
     if vm_process is None:
-        print("[!] VM failed to start. Exiting.")
+        print("[!] VM failed to start.")
         return
 
-    # Re-transfer and compile executor inside VM to ensure latest
-    print("[*] Transferring executor source to VM...")
+    # Transfer and compile executor inside VM
     if not transfer_file_to_vm(EXECUTOR_SOURCE_PATH, "/root/executor.c"):
-        print("[!] Failed to transfer executor source. Halting.")
+        print("[!] Transfer failed.")
         vm_process.terminate()
-        vm_process.wait()
         return
-
-    print("[*] Installing build tools inside VM (apk add build-base)...")
-    if run_command_in_vm("apk add --no-cache build-base", timeout=120) is None:
-        print("[!] Failed to install build-base in VM.")
-        vm_process.terminate()
-        vm_process.wait()
-        return
-
-    print("[*] Compiling executor inside VM...")
+    run_command_in_vm("apk add --no-cache build-base", timeout=120)
     if run_command_in_vm(f"gcc /root/executor.c -o {EXECUTOR_VM_PATH}", timeout=60) is None:
-        print("[!] Compilation inside VM failed.")
+        print("[!] Compilation failed inside VM.")
         vm_process.terminate()
-        vm_process.wait()
         return
 
-    # Verify compiled executor exists
     if run_command_in_vm(f"test -f {EXECUTOR_VM_PATH}", suppress_errors=True) is None:
-        print("[!] Verification of executor failed inside VM.")
+        print("[!] Executor missing inside VM.")
         vm_process.terminate()
-        vm_process.wait()
         return
 
-    print("[+] Executor compiled and verified in VM. Powering VM down to start fuzz loops.")
-    # Shutdown VM and restart per-session to ensure clean state between runs
+    print("[+] Executor compiled. Powering off VM for clean session...")
     run_command_in_vm("poweroff", suppress_errors=True, timeout=10)
     try:
         vm_process.wait(timeout=30)
@@ -347,39 +346,28 @@ def main():
     print("#" + " "*15 + "FUZZER READY" + " "*21 + "#")
     print("#"*50)
 
-    # Main loop: restart VM per session (gives a clean environment)
     try:
         while True:
             vm_process = start_and_wait_for_vm()
             if vm_process is None:
-                print("[!] VM startup failed; halting fuzzing.")
+                print("[!] VM startup failed.")
                 break
-
             crashed = not run_fuzzing_session(vm_process)
-
             print("[*] Session ended. Cleaning up VM...")
             if crashed:
-                # If we detected a crash, forcibly terminate and restart for next session
-                try:
-                    vm_process.terminate()
-                    vm_process.wait(timeout=10)
-                except Exception:
-                    pass
-                print("[+] VM terminated after crash. Will restart for next session.")
+                vm_process.terminate()
+                print("[+] VM terminated after crash. Restarting next session.")
             else:
-                # Graceful shutdown after a clean run
                 run_command_in_vm("poweroff", suppress_errors=True, timeout=10)
                 try:
                     vm_process.wait(timeout=30)
                 except subprocess.TimeoutExpired:
                     vm_process.terminate()
-                print("[+] VM shutdown after clean session. Exiting.")
+                print("[+] VM shutdown cleanly. Exiting.")
                 break
-
-            # brief pause before next session
             time.sleep(3)
     except KeyboardInterrupt:
-        print("\n[!] Fuzzer main loop interrupted by user. Shutting down.")
+        print("\n[!] Interrupted. Shutting down VM...")
         try:
             vm_process.terminate()
         except Exception:
