@@ -5,6 +5,7 @@ import time
 # -----------------------
 # Interesting Values
 # -----------------------
+
 INTERESTING_VALUES = {
     "int": [-1, 0, 1, 2, 64, 1024, 4096, 0x7FFFFFFF, 0xFFFFFFFF],
     "flags": [0, 1, 2, 0x80000000, 0xFFFFFFFF],
@@ -15,6 +16,7 @@ INTERESTING_VALUES = {
 # -----------------------
 # Type Generators
 # -----------------------
+
 def gen_random_int(arg_spec=None):
     return random.randint(-2**31, 2**31 - 1)
 
