@@ -1,3 +1,4 @@
+This is for linux debian distro
 Step 1: Install Core Software on Your Host Machine
 
 First, we need to install QEMU (the virtualizer), a C compiler, and Python. Open a terminal on your Linux machine (or WSL on Windows) and run the following:
