@@ -394,34 +394,45 @@ class FuzzingEngine:
     """Core fuzzing logic"""
     
     # Regex to parse executor output
-    RE_SYSCALL_RET = re.compile(r"syscall\((\d+)\)\s*=\s*(-?\d+)")
+    # RE_SYSCALL_RET = re.compile(r"syscall\((\d+)\)\s*=\s*(-?\d+)")
     
     def __init__(self, ssh_runner, crash_logger):
         self.ssh_runner = ssh_runner
         self.crash_logger = crash_logger
         self.iteration = 0
+        # --- ADD THIS BLOCK ---
+        self.corpus_dir = Path("corpus")
+        self.corpus_dir.mkdir(exist_ok=True)
+        self.coverage = set()
+        # --- END ADD ---
         self.stats = {
             "total_syscalls": 0,
             "total_sequences": 0,
-            "crashes": 0
+            "crashes": 0,
+            "new_coverage": 0  # <-- Add this line
         }
         self.resource_pool = {
             "fd": [],
         }
         print("[*] Fuzzing engine initialized with an empty resource pool.")
     
+    # Regex to parse executor output, now with an optional coverage group
+    RE_SYSCALL_RET = re.compile(r"syscall\((\d+)\)\s*=\s*(-?\d+).*coverage=(\d+)")
+
     def parse_executor_output(self, stdout):
-        """Extract syscall return value from executor output"""
+        """Extract syscall return and coverage values from executor output"""
         if not stdout:
-            return None
+            return None, None
         
         match = self.RE_SYSCALL_RET.search(stdout)
         if match:
             try:
-                return int(match.group(2))
-            except ValueError:
-                return None
-        return None
+                ret_val = int(match.group(2))
+                coverage = int(match.group(3))
+                return ret_val, coverage
+            except (ValueError, IndexError):
+                return None, None
+        return None, None
     
     def resolve_argument(self, arg_spec, env):
         """
@@ -488,14 +499,17 @@ class FuzzingEngine:
         Execute a single syscall and return result
         
         Returns:
-            (success: bool, return_value: int or None)
+            (success: bool, (return_value: int or None, coverage: int or None))
         """
         command = f"{Config.EXECUTOR_VM_PATH} {syscall_name} {' '.join(args)}"
         result = self.ssh_runner.run_command(command)
         
         if result is None:
             # Command failed - potential crash
-            return False, None
+            return False, (None, None)
+        
+        ret_val, coverage = self.parse_executor_output(result.stdout)
+        return True, (ret_val, coverage)
         
         ret_val = self.parse_executor_output(result.stdout)
         return True, ret_val
@@ -549,8 +563,9 @@ class FuzzingEngine:
         print('=' * 70)
         
         # Decide: single syscall or sequence?
+        # Note: We are only implementing coverage feedback for single syscalls for now.
         if random.random() < Config.SEQUENCE_PROBABILITY and SYSCALL_SEQUENCES:
-            # Execute sequence
+            # Execute sequence (original logic)
             sequence_name, steps = random.choice(list(SYSCALL_SEQUENCES.items()))
             success, commands = self.execute_sequence(sequence_name, steps)
             
@@ -575,27 +590,32 @@ class FuzzingEngine:
         else:
             # Execute single syscall
             syscall_name, args = self.generate_random_syscall()
+            command = f"{Config.EXECUTOR_VM_PATH} {syscall_name} {' '.join(args)}"
             print(f"[*] Testing: {syscall_name}({', '.join(args)})")
             
-            success, ret_val = self.execute_syscall(syscall_name, args)
-            if success and ret_val is not None and ret_val > 2:
-                # This is a list of common syscalls that return file descriptors.
-                resource_creating_syscalls = [
-                    "open", "openat", "pipe", "socket", "accept", "accept4",
-                    "dup", "dup2", "dup3", "epoll_create", "epoll_create1",
-                    "eventfd", "eventfd2", "memfd_create", "signalfd", "timerfd_create"
-                ]
-                if syscall_name in resource_creating_syscalls:
-                    print(f"[+] New resource created: fd={ret_val}. Adding to pool.")
-                    self.resource_pool["fd"].append(ret_val)
-            # --- END ADD ---
-
+            success, (ret_val, coverage) = self.execute_syscall(syscall_name, args)
+            
             self.stats["total_syscalls"] += 1
+            
+            # --- THIS IS THE CORE LOGIC FOR COVERAGE FEEDBACK ---
+            if success and coverage is not None and coverage > 0:
+                # We use a simple hash of the coverage value for this example.
+                # In a real-world fuzzer, you'd process the full coverage buffer.
+                if coverage not in self.coverage:
+                    print(f"\n{'*' * 25} NEW COVERAGE FOUND! ({coverage}) {'*' * 25}")
+                    self.coverage.add(coverage)
+                    self.stats["new_coverage"] += 1
+                    
+                    # Save the input that generated new coverage to the corpus
+                    corpus_filename = self.corpus_dir / f"coverage_{coverage}_iter_{self.iteration}"
+                    with open(corpus_filename, "w") as f:
+                        f.write(command)
+                    print(f"[+] Saved new input to: {corpus_filename}")
+            # --- END OF CORE LOGIC ---
             
             if not success:
                 # Crash detected
                 self.stats["crashes"] += 1
-                command = f"{Config.EXECUTOR_VM_PATH} {syscall_name} {' '.join(args)}"
                 crash_dir = self.crash_logger.log_crash(
                     command,
                     crash_context={
@@ -603,6 +623,7 @@ class FuzzingEngine:
                         "syscall": syscall_name,
                         "args": args,
                         "iteration": self.iteration,
+                        "coverage": coverage,
                         "stats": self.stats.copy()
                     }
                 )
@@ -610,7 +631,7 @@ class FuzzingEngine:
                 return False
             
             if ret_val is not None:
-                print(f"[+] Return value: {ret_val}")
+                print(f"[+] Return value: {ret_val} | Coverage: {coverage}")
         
         return True
     
@@ -655,7 +676,14 @@ def setup_executor(ssh_runner):
     print("\n" + "=" * 70)
     print("EXECUTOR SETUP")
     print("=" * 70)
-    
+    # --- ADD THIS BLOCK ---
+    # Mount debugfs for KCOV if it's not already mounted
+    print("[*] Mounting debugfs for KCOV...")
+    ssh_runner.run_command(
+        "mountpoint -q /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug"
+    )
+    # --- END ADD ---
+
     # Transfer source
     if not ssh_runner.transfer_file(Config.EXECUTOR_SOURCE, "/root/executor.c"):
         print("[!] Failed to transfer executor source")

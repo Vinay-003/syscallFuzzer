@@ -1,5 +1,0 @@
---- Syscall Fuzzer Crash Report ---
-Timestamp: 2025-09-07_23-03-55
-
---- Reproducer Command(s) ---
-/root/executor lstat 4096 3221225472

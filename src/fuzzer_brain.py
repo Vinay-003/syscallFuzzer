@@ -857,7 +857,7 @@ SYSCALL_SPECS = {
 # -----------------------
 # Syscall Sequences
 # -----------------------
-SSYSCALL_SEQUENCES = {
+SYSCALL_SEQUENCES = {
     # --- Original Sequences (Corrected for Stateful Fuzzing) ---
     "uaf_double_close": [
         {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o101}, {"literal": 0o644}], "result": "fd1"},

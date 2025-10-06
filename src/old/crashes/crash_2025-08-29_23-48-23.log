@@ -1,5 +1,0 @@
---- Syscall Fuzzer Crash Report ---
-Timestamp: 2025-08-29_23-48-23
-
---- Reproducer Command ---
-/root/executor read 0 0 4294967295
