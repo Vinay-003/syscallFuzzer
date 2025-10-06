@@ -7,11 +7,163 @@ import time
 # -----------------------
 
 INTERESTING_VALUES = {
-    "int": [-1, 0, 1, 2, 64, 1024, 4096, 8192, 0x7FFFFFFF, 0xFFFFFFFF, -2147483648],
-    "flags": [0, 1, 2, 4, 8, 0x80000000, 0xFFFFFFFF, 0x7FFFFFFF],
-    "pid": [-1, 0, 1, 2, 32768, 65535],
-    "mode": [0o777, 0o644, 0o600, 0o755, 0o400, 0o000, 0o4755],
-    "offset": [0, 1, -1, 4096, 0x7FFFFFFF, -0x80000000],
+    # Integer boundaries and special values
+    "int": [
+        # Standard interesting integers
+        -1, 0, 1, 2, 16, 32, 64, 127, 128, 255, 256,
+        512, 1024, 2048, 4096, 8192, 16384, 32768, 65535, 65536,
+        
+        # Signed 32-bit boundaries
+        0x7FFFFFFF,  # INT_MAX
+        -0x80000000,  # INT_MIN
+        0x7FFFFFFE,  # INT_MAX - 1
+        -0x7FFFFFFF,  # INT_MIN + 1
+        
+        # Unsigned 32-bit
+        0xFFFFFFFF,  # UINT_MAX
+        0xFFFFFFFE,  # UINT_MAX - 1
+        
+        # Power of 2 boundaries (common in allocation)
+        0x10000,  # 64KB
+        0x100000,  # 1MB
+        0x1000000,  # 16MB
+        
+        # Negative wraps
+        -2, -3, -4, -8, -16, -32, -64, -128, -256, -512, -1024,
+    ],
+    
+    # Size values (for buffer operations)
+    "size": [
+        0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64,
+        127, 128, 255, 256, 511, 512, 1023, 1024,
+        
+        # Page-related sizes
+        4095, 4096, 4097,  # Page boundary
+        8191, 8192, 8193,  # 2 pages
+        
+        # Large allocations
+        65535, 65536, 65537,  # 64KB boundary
+        0x7FFFFFFF,  # Max positive int
+        0xFFFFFFFF,  # Max unsigned (often causes wraps)
+        0x80000000,  # Sign bit set
+        
+        # Allocation edge cases
+        0x100000,  # 1MB
+        0x1000000,  # 16MB (common kmalloc limit)
+    ],
+    
+    # Memory addresses (pointer values)
+    "addr": [
+        0x0,  # NULL pointer
+        0x1, 0x2, 0x4, 0x8, 0x10, 0x100, 0x1000,  # Low addresses
+        
+        # Common kernel addresses (user/kernel boundary)
+        0xFFFFFFFF,  # -1 as pointer
+        0xFFFFFFFE,
+        0xFFFFFF00,
+        
+        # User space boundaries
+        0x7FFFFFFF,
+        0x80000000,  # Sign bit
+        
+        # Page alignment boundaries
+        0xFFF, 0x1000, 0x1001,  # Page boundary
+        0xFFFF, 0x10000, 0x10001,  # 64KB boundary
+        
+        # Stack/heap common addresses
+        0x7FFFFFFFE000,  # Near top of user space
+        0xC0000000,  # Common kernel base on 32-bit
+        
+        # Unaligned pointers
+        0x1001, 0x1002, 0x1003,  # Misaligned
+    ],
+    
+    # File descriptors
+    "fd": [
+        -1,  # Invalid FD
+        0, 1, 2,  # stdin, stdout, stderr
+        3, 4, 5,  # First user FDs
+        
+        # Edge cases
+        100, 255, 256, 1023, 1024,  # Around typical limits
+        65535, 65536,  # Max FD values
+        
+        # Negative values (error conditions)
+        -2, -3, -100, -1000,
+        
+        # Large values
+        0x7FFFFFFF,  # Max int
+        0xFFFFFFFF,  # Unsigned max
+    ],
+    
+    # Process IDs
+    "pid": [
+        -1,  # Special: all processes
+        0,  # Special: current process
+        1,  # init process
+        2,  # kthreadd
+        
+        # Common PIDs
+        100, 1000, 10000, 32768, 65535,
+        
+        # Boundaries
+        0x7FFFFFFF,  # Max PID
+        -0x80000000,  # Min (negative wrap)
+    ],
+    
+    # File modes/permissions
+    "mode": [
+        0o000, 0o001, 0o002, 0o004,  # Individual bits
+        0o400, 0o200, 0o100,  # Owner only
+        0o600, 0o644, 0o755, 0o777,  # Common modes
+        
+        # With special bits
+        0o4755,  # setuid
+        0o2755,  # setgid
+        0o1777,  # sticky
+        0o7777,  # All bits
+        
+        # Invalid/interesting
+        0xFFFF,  # Too many bits
+        0o10000, 0o20000,  # Beyond valid range
+    ],
+    
+    # File offsets
+    "offset": [
+        -1, 0, 1,
+        
+        # Page boundaries
+        4095, 4096, 4097,
+        
+        # Common seek positions
+        1024, 4096, 8192, 65536,
+        
+        # Large offsets
+        0x7FFFFFFF,  # Max 32-bit offset
+        0x7FFFFFFFFFFFFFFF,  # Max 64-bit offset
+        -0x80000000,  # Negative wrap
+        
+        # Just before/after boundaries
+        0x7FFFFFFE, 0x80000000, 0x80000001,
+    ],
+    
+    # Flags (generic bit patterns)
+    "flags": [
+        0,  # No flags
+        1, 2, 4, 8, 16, 32, 64, 128,  # Single bits
+        
+        # Common combinations
+        3, 7, 15, 31, 63, 127, 255,
+        
+        # Sign bit and combinations
+        0x80000000, 0xC0000000, 0xF0000000,
+        
+        # All bits
+        0xFFFFFFFF, 0x7FFFFFFF,
+        
+        # Invalid combinations (all bits set)
+        0xAAAAAAAA, 0x55555555,  # Alternating patterns
+    ],
 }
 
 # -----------------------
@@ -186,6 +338,79 @@ def gen_timer_flags(arg_spec=None):
 def gen_clock_id(arg_spec=None):
     """Generate clock ID"""
     return random.choice([0, 1, 2, 3, 4, 5, 6, 7])
+def gen_boundary_int():
+    """Generate integers around common boundaries"""
+    boundaries = [
+        (127, 128, 129),  # signed byte
+        (255, 256, 257),  # unsigned byte
+        (32767, 32768, 32769),  # signed short
+        (65535, 65536, 65537),  # unsigned short
+        (0x7FFFFFFE, 0x7FFFFFFF, 0x80000000),  # signed int
+        (0xFFFFFFFE, 0xFFFFFFFF, 0x100000000),  # unsigned int
+    ]
+    boundary = random.choice(boundaries)
+    return random.choice(boundary)
+
+def gen_misaligned_addr():
+    """Generate intentionally misaligned addresses"""
+    base = random.choice([0x1000, 0x10000, 0x100000])
+    offset = random.choice([1, 2, 3, 5, 6, 7])  # Not 4-byte aligned
+    return base + offset
+
+def gen_negative_size():
+    """Generate negative values that might wrap to large positive"""
+    return random.choice([-1, -2, -4, -8, -16, -32, -64, -128, -256])
+
+def gen_overlapping_ranges():
+    """Generate size/offset pairs that might cause overlaps"""
+    base = random.randint(0x1000, 0x10000)
+    size = random.choice([0xFFFFFFFF - base + 100, 0x7FFFFFFF, base + 0x1000000])
+    return (base, size)
+
+def gen_allocation_bomb():
+    """Generate sizes that might cause allocation issues"""
+    return random.choice([
+        0xFFFFFFFF,  # Max unsigned (often wraps to 0 or causes overflow)
+        0x7FFFFFFF,  # Max signed
+        0x40000000,  # 1GB
+        0x10000000,  # 256MB
+        0x1000000,   # 16MB (common kmalloc limit)
+    ])
+
+def gen_time_value():
+    """Generate time values with edge cases"""
+    return random.choice([
+        -1,  # Error value
+        0,  # Epoch
+        1,  # Just after epoch
+        0x7FFFFFFF,  # Y2038 problem (32-bit time_t max)
+        0x80000000,  # Just after Y2038
+        0xFFFFFFFF,  # Max unsigned 32-bit
+    ])
+
+def gen_signal_value():
+    """Generate signal numbers including invalid ones"""
+    return random.choice([
+        -1, 0,  # Invalid
+        1, 2, 3, 9, 11, 15, 17, 19,  # Valid signals
+        31, 32, 33,  # Real-time signal boundaries
+        64, 65,  # Beyond valid range
+        255, 256,  # Way beyond
+        0x7FFFFFFF,  # Max int
+    ])
+
+def gen_bitfield_corruption():
+    """Generate values with unusual bit patterns"""
+    patterns = [
+        0xAAAAAAAA,  # Alternating bits
+        0x55555555,  # Alternating bits (inverted)
+        0xDEADBEEF,  # Classic debug pattern
+        0xFEEDFACE,  # Another debug pattern
+        0x12345678,  # Sequential pattern
+        0x80000001,  # Sign bit + LSB
+        0x7FFFFFFF,  # All bits except sign
+    ]
+    return random.choice(patterns)
 
 # Map type strings to generator functions
 TYPE_GENERATORS = {
@@ -199,6 +424,13 @@ TYPE_GENERATORS = {
     "offset": gen_offset,
     "signal": gen_signal,
     "cpu": gen_cpu,
+    "boundary_int": gen_boundary_int,
+    "misaligned_addr": gen_misaligned_addr,
+    "negative_size": gen_negative_size,
+    "allocation_bomb": gen_allocation_bomb,
+    "time_value": gen_time_value,
+    "signal_value": gen_signal_value,
+    "bitfield_corruption": gen_bitfield_corruption,
     
     # File operations
     "open_flags": gen_open_flags,
@@ -652,5 +884,46 @@ SYSCALL_SEQUENCES = {
         {"action": "close", "args": [{"value": "pipe_fd"}]},
         {"action": "write", "args": [{"value": "pipe_fd"}, "addr", "size"]}
     ],
+    ## Race conditions and memory corruption patterns
+    # Double free pattern
+    "double_free_mmap": [
+        {"action": "mmap", "args": ["addr", "size", "mmap_prot", "mmap_flags", "fd", "offset"], "result": "map_addr"},
+        {"action": "munmap", "args": [{"value": "map_addr"}, "size"]},
+        {"action": "munmap", "args": [{"value": "map_addr"}, "size"]},  # Double free
+    ],
     
+    # Use-after-munmap
+    "uaf_mmap": [
+        {"action": "mmap", "args": ["addr", "size", "mmap_prot", "mmap_flags", "fd", "offset"], "result": "map_addr"},
+        {"action": "munmap", "args": [{"value": "map_addr"}, "size"]},
+        {"action": "mprotect", "args": [{"value": "map_addr"}, "size", "mmap_prot"]},  # Use after free
+    ],
+    
+    # Integer overflow in size calculations
+    "size_overflow": [
+        {"action": "mmap", "args": ["addr", {"literal": 0xFFFFFFFF}, "mmap_prot", "mmap_flags", "fd", "offset"], "result": "map_addr"},
+    ],
+    
+    # Overlapping memory operations
+    "overlap_race": [
+        {"action": "mmap", "args": [{"literal": 0x10000}, {"literal": 0x2000}, "mmap_prot", "mmap_flags", "fd", "offset"], "result": "map1"},
+        {"action": "mmap", "args": [{"literal": 0x11000}, {"literal": 0x2000}, "mmap_prot", "mmap_flags", "fd", "offset"], "result": "map2"},
+        {"action": "munmap", "args": [{"literal": 0x10000}, {"literal": 0x3000}]},  # Overlapping unmap
+    ],
+        "negative_offset_read": [
+        {"action": "open", "args": ["addr", "open_flags", "mode"], "result": "fd"},
+        {"action": "lseek", "args": [{"value": "fd"}, {"literal": -1}, {"literal": 0}]},
+        {"action": "read", "args": [{"value": "fd"}, "addr", "size"]},
+    ],
+    
+    "huge_allocation": [
+        {"action": "mmap", "args": ["addr", {"literal": 0x7FFFFFFF}, "mmap_prot", "mmap_flags", "fd", "offset"]},
+    ],
+    
+    "fd_confusion": [
+        {"action": "open", "args": ["addr", "open_flags", "mode"], "result": "fd1"},
+        {"action": "dup2", "args": [{"value": "fd1"}, {"literal": 100}], "result": "fd2"},
+        {"action": "close", "args": [{"value": "fd1"}]},
+        {"action": "write", "args": [{"literal": 100}, "addr", "size"]},
+    ],
 }

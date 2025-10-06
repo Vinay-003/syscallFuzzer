@@ -1,0 +1,5 @@
+--- Syscall Fuzzer Crash Report ---
+Timestamp: 2025-09-07_21-35-40
+
+--- Reproducer Command(s) ---
+/root/executor exit 1991231835

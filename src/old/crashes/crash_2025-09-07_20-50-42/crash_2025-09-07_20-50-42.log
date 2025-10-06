@@ -1,0 +1,5 @@
+--- Syscall Fuzzer Crash Report ---
+Timestamp: 2025-09-07_20-50-42
+
+--- Reproducer Command(s) ---
+/root/executor vfork 

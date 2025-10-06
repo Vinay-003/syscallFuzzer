@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 # Import configuration
-from fuzzer_config import SYSCALL_SPECS, SYSCALL_SEQUENCES, TYPE_GENERATORS
+from fuzzer_brain import SYSCALL_SPECS, SYSCALL_SEQUENCES, TYPE_GENERATORS
 
 # ============================================================================
 # CONFIGURATION
@@ -143,30 +143,30 @@ class CrashLogger:
         """Collect dmesg and other logs from VM"""
         print("[*] Collecting VM logs...")
         
-        # Try to get dmesg
-        try:
-            result = ssh_runner.run_command(
-                "dmesg -T > /tmp/crash_dmesg.txt 2>&1",
-                suppress_errors=True,
-                timeout=15
-            )
+        # # Try to get dmesg
+        # try:
+        #     result = ssh_runner.run_command(
+        #         "dmesg -T > /tmp/crash_dmesg.txt 2>&1",
+        #         suppress_errors=True,
+        #         timeout=15
+        #     )
             
-            if result:
-                ssh_runner.fetch_file(
-                    "/tmp/crash_dmesg.txt",
-                    crash_dir / "dmesg.txt"
-                )
-        except Exception as e:
-            print(f"[!] Failed to collect dmesg: {e}")
+        #     if result:
+        #         ssh_runner.fetch_file(
+        #             "/tmp/crash_dmesg.txt",
+        #             crash_dir / "dmesg.txt"
+        #         )
+        # except Exception as e:
+        #     print(f"[!] Failed to collect dmesg: {e}")
         
-        # Try to get kernel logs
-        try:
-            ssh_runner.fetch_file(
-                "/var/log/messages",
-                crash_dir / "kernel_messages.log"
-            )
-        except Exception:
-            pass
+        # # Try to get kernel logs
+        # try:
+        #     ssh_runner.fetch_file(
+        #         "/var/log/messages",
+        #         crash_dir / "kernel_messages.log"
+        #     )
+        # except Exception:
+        #     pass
         
         print("[+] Log collection complete")
 
