@@ -405,6 +405,10 @@ class FuzzingEngine:
             "total_sequences": 0,
             "crashes": 0
         }
+        self.resource_pool = {
+            "fd": [],
+        }
+        print("[*] Fuzzing engine initialized with an empty resource pool.")
     
     def parse_executor_output(self, stdout):
         """Extract syscall return value from executor output"""
@@ -430,13 +434,30 @@ class FuzzingEngine:
         Returns:
             String representation of the argument value
         """
-        # Handle environment variable reference
+        # Handle literal value from sequence definition (e.g., {'literal': 123})
+        if isinstance(arg_spec, dict) and "literal" in arg_spec:
+            return str(arg_spec["literal"])
+        
+        # Handle environment variable reference (e.g., {'value': 'fd1'})
         if isinstance(arg_spec, dict) and "value" in arg_spec:
             var_name = arg_spec["value"]
             return str(env.get(var_name, 0))
         
         # Handle type generator
         if isinstance(arg_spec, str):
+            # --- LOGIC TO USE THE POOL STARTS HERE ---
+            if arg_spec == "valid_fd":
+                if self.resource_pool["fd"]:
+                    # We have valid FDs, let's use one!
+                    chosen_fd = random.choice(self.resource_pool["fd"])
+                    print(f"[*] Using valid resource from pool: fd={chosen_fd}")
+                    return str(chosen_fd)
+                else:
+                    # Pool is empty, fall back to the original random generator.
+                    # This keeps the fuzzer running even before it finds a valid FD.
+                    return str(TYPE_GENERATORS['fd']())
+            # --- LOGIC TO USE THE POOL ENDS HERE ---
+
             # Check if it's an env variable
             if arg_spec in env:
                 return str(env[arg_spec])
@@ -557,7 +578,18 @@ class FuzzingEngine:
             print(f"[*] Testing: {syscall_name}({', '.join(args)})")
             
             success, ret_val = self.execute_syscall(syscall_name, args)
-            
+            if success and ret_val is not None and ret_val > 2:
+                # This is a list of common syscalls that return file descriptors.
+                resource_creating_syscalls = [
+                    "open", "openat", "pipe", "socket", "accept", "accept4",
+                    "dup", "dup2", "dup3", "epoll_create", "epoll_create1",
+                    "eventfd", "eventfd2", "memfd_create", "signalfd", "timerfd_create"
+                ]
+                if syscall_name in resource_creating_syscalls:
+                    print(f"[+] New resource created: fd={ret_val}. Adding to pool.")
+                    self.resource_pool["fd"].append(ret_val)
+            # --- END ADD ---
+
             self.stats["total_syscalls"] += 1
             
             if not success:

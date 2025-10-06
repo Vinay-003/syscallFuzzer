@@ -5,6 +5,13 @@ import time
 # -----------------------
 # Interesting Values
 # -----------------------
+VALID_PATHS = [
+    "/tmp/fuzzfile",
+    "/dev/null",
+    "/dev/zero",
+    "/etc/passwd", # A read-only file
+    "nonexistent_file" # A file that doesn't exist
+]
 
 INTERESTING_VALUES = {
     # Integer boundaries and special values
@@ -179,6 +186,9 @@ def gen_random_int(arg_spec=None):
 def gen_fd(arg_spec=None):
     """Generate file descriptor"""
     return random.choice(INTERESTING_VALUES["int"] + [-1, 0, 1, 2, 3, 100, 1000])
+def gen_path(arg_spec=None):
+    """Generate a valid-looking file path."""
+    return random.choice(VALID_PATHS)
 
 def gen_addr(arg_spec=None):
     """Generate memory address with interesting values"""
@@ -431,7 +441,7 @@ TYPE_GENERATORS = {
     "time_value": gen_time_value,
     "signal_value": gen_signal_value,
     "bitfield_corruption": gen_bitfield_corruption,
-    
+
     # File operations
     "open_flags": gen_open_flags,
     "fcntl_cmd": gen_fcntl_cmd,
@@ -537,6 +547,10 @@ TYPE_GENERATORS = {
     "bpf_cmd": gen_bpf_cmd,
     "keyctl_cmd": gen_keyctl_cmd,
     "mount_flags": gen_mount_flags,
+
+
+    "path": gen_path,
+    "valid_fd": None,  # Placeholder for a valid file descriptor from the pool
 }
 
 # -----------------------
@@ -560,100 +574,100 @@ SYSCALL_SPECS = {
     "membarrier": ["random_int", "flags"],
     
     # === File Operations ===
-    "open": ["addr", "open_flags", "mode"],
-    "openat": ["fd", "addr", "open_flags", "mode"],
-    "close": ["fd"],
-    "read": ["fd", "addr", "size"],
-    "write": ["fd", "addr", "size"],
-    "readv": ["fd", "addr", "random_int"],
-    "writev": ["fd", "addr", "random_int"],
-    "pread64": ["fd", "addr", "size", "offset"],
-    "pwrite64": ["fd", "addr", "size", "offset"],
-    "preadv": ["fd", "addr", "random_int", "offset"],
-    "pwritev": ["fd", "addr", "random_int", "offset"],
-    "lseek": ["fd", "offset", "random_int"],
-    "dup": ["fd"],
-    "dup2": ["fd", "fd"],
-    "dup3": ["fd", "fd", "flags"],
+    "open": ["path", "open_flags", "mode"],
+    "openat": ["fd", "path", "open_flags", "mode"],
+    "close": ["valid_fd"],
+    "read": ["valid_fd", "addr", "size"],
+    "write": ["valid_fd", "addr", "size"],
+    "readv": ["valid_fd", "addr", "random_int"],
+    "writev": ["valid_fd", "addr", "random_int"],
+    "pread64": ["valid_fd", "addr", "size", "offset"],
+    "pwrite64": ["valid_fd", "addr", "size", "offset"],
+    "preadv": ["valid_fd", "addr", "random_int", "offset"],
+    "pwritev": ["valid_fd", "addr", "random_int", "offset"],
+    "lseek": ["valid_fd", "offset", "random_int"],
+    "dup": ["valid_fd"],
+    "dup2": ["valid_fd", "fd"],
+    "dup3": ["valid_fd", "fd", "flags"],
     "pipe": ["addr"],
     "pipe2": ["addr", "flags"],
     
     # === File Metadata ===
-    "stat": ["addr", "addr"],
-    "fstat": ["fd", "addr"],
-    "lstat": ["addr", "addr"],
-    "fstatat": ["fd", "addr", "addr", "flags"],
-    "statx": ["fd", "addr", "flags", "random_int", "addr"],
-    "access": ["addr", "flags"],
-    "faccessat": ["fd", "addr", "flags"],
-    "faccessat2": ["fd", "addr", "flags", "flags"],
+    "stat": ["path", "addr"],
+    "fstat": ["valid_fd", "addr"],
+    "lstat": ["path", "addr"],
+    "fstatat": ["fd", "path", "addr", "flags"],
+    "statx": ["fd", "path", "flags", "random_int", "addr"],
+    "access": ["path", "flags"],
+    "faccessat": ["fd", "path", "flags"],
+    "faccessat2": ["fd", "path", "flags", "flags"],
     
     # === File Operations (Advanced) ===
-    "fcntl": ["fd", "fcntl_cmd", "random_int"],
-    "ioctl": ["fd", "ioctl_request", "addr"],
-    "flock": ["fd", "random_int"],
-    "fsync": ["fd"],
-    "fdatasync": ["fd"],
+    "fcntl": ["valid_fd", "fcntl_cmd", "random_int"],
+    "ioctl": ["valid_fd", "ioctl_request", "addr"],
+    "flock": ["valid_fd", "random_int"],
+    "fsync": ["valid_fd"],
+    "fdatasync": ["valid_fd"],
     "sync": [],
-    "truncate": ["addr", "size"],
-    "ftruncate": ["fd", "size"],
-    "fallocate": ["fd", "random_int", "offset", "size"],
-    "sendfile": ["fd", "fd", "addr", "size"],
-    "copy_file_range": ["fd", "addr", "fd", "addr", "size", "flags"],
-    "splice": ["fd", "addr", "fd", "addr", "size", "splice_flags"],
-    "vmsplice": ["fd", "addr", "random_int", "flags"],
-    "tee": ["fd", "fd", "size", "flags"],
+    "truncate": ["path", "size"],
+    "ftruncate": ["valid_fd", "size"],
+    "fallocate": ["valid_fd", "random_int", "offset", "size"],
+    "sendfile": ["valid_fd", "valid_fd", "addr", "size"],
+    "copy_file_range": ["valid_fd", "addr", "valid_fd", "addr", "size", "flags"],
+    "splice": ["valid_fd", "addr", "valid_fd", "addr", "size", "splice_flags"],
+    "vmsplice": ["valid_fd", "addr", "random_int", "flags"],
+    "tee": ["valid_fd", "valid_fd", "size", "flags"],
     
     # === Directory Operations ===
     "getcwd": ["addr", "size"],
-    "chdir": ["addr"],
-    "fchdir": ["fd"],
-    "chroot": ["addr"],
-    "mkdir": ["addr", "mode"],
-    "mkdirat": ["fd", "addr", "mode"],
-    "rmdir": ["addr"],
-    "getdents64": ["fd", "addr", "size"],
+    "chdir": ["path"],
+    "fchdir": ["valid_fd"],
+    "chroot": ["path"],
+    "mkdir": ["path", "mode"],
+    "mkdirat": ["fd", "path", "mode"],
+    "rmdir": ["path"],
+    "getdents64": ["valid_fd", "addr", "size"],
     
     # === Link Operations ===
-    "link": ["addr", "addr"],
-    "linkat": ["fd", "addr", "fd", "addr", "flags"],
-    "symlink": ["addr", "addr"],
-    "symlinkat": ["addr", "fd", "addr"],
-    "readlink": ["addr", "addr", "size"],
-    "readlinkat": ["fd", "addr", "addr", "size"],
-    "unlink": ["addr"],
-    "unlinkat": ["fd", "addr", "flags"],
-    "rename": ["addr", "addr"],
-    "renameat": ["fd", "addr", "fd", "addr"],
-    "renameat2": ["fd", "addr", "fd", "addr", "flags"],
+    "link": ["path", "path"],
+    "linkat": ["fd", "path", "fd", "path", "flags"],
+    "symlink": ["path", "path"],
+    "symlinkat": ["path", "fd", "path"],
+    "readlink": ["path", "addr", "size"],
+    "readlinkat": ["fd", "path", "addr", "size"],
+    "unlink": ["path"],
+    "unlinkat": ["fd", "path", "flags"],
+    "rename": ["path", "path"],
+    "renameat": ["fd", "path", "fd", "path"],
+    "renameat2": ["fd", "path", "fd", "path", "flags"],
     
     # === Permissions ===
-    "chmod": ["addr", "mode"],
-    "fchmod": ["fd", "mode"],
-    "fchmodat": ["fd", "addr", "mode", "flags"],
-    "chown": ["addr", "random_int", "random_int"],
-    "fchown": ["fd", "random_int", "random_int"],
-    "fchownat": ["fd", "addr", "random_int", "random_int", "flags"],
+    "chmod": ["path", "mode"],
+    "fchmod": ["valid_fd", "mode"],
+    "fchmodat": ["fd", "path", "mode", "flags"],
+    "chown": ["path", "random_int", "random_int"],
+    "fchown": ["valid_fd", "random_int", "random_int"],
+    "fchownat": ["fd", "path", "random_int", "random_int", "flags"],
     "umask": ["mode"],
     
     # === Extended Attributes ===
-    "setxattr": ["addr", "addr", "addr", "size", "flags"],
-    "lsetxattr": ["addr", "addr", "addr", "size", "flags"],
-    "fsetxattr": ["fd", "addr", "addr", "size", "flags"],
-    "getxattr": ["addr", "addr", "addr", "size"],
-    "lgetxattr": ["addr", "addr", "addr", "size"],
-    "fgetxattr": ["fd", "addr", "addr", "size"],
-    "listxattr": ["addr", "addr", "size"],
-    "llistxattr": ["addr", "addr", "size"],
-    "flistxattr": ["fd", "addr", "size"],
-    "removexattr": ["addr", "addr"],
-    "lremovexattr": ["addr", "addr"],
-    "fremovexattr": ["fd", "addr"],
+    "setxattr": ["path", "addr", "addr", "size", "flags"],
+    "lsetxattr": ["path", "addr", "addr", "size", "flags"],
+    "fsetxattr": ["valid_fd", "addr", "addr", "size", "flags"],
+    "getxattr": ["path", "addr", "addr", "size"],
+    "lgetxattr": ["path", "addr", "addr", "size"],
+    "fgetxattr": ["valid_fd", "addr", "addr", "size"],
+    "listxattr": ["path", "addr", "size"],
+    "llistxattr": ["path", "addr", "size"],
+    "flistxattr": ["valid_fd", "addr", "size"],
+    "removexattr": ["path", "addr"],
+    "lremovexattr": ["path", "addr"],
+    "fremovexattr": ["valid_fd", "addr"],
     
     # === Time Operations ===
-    "utime": ["addr", "addr"],
-    "utimes": ["addr", "addr"],
-    "utimensat": ["fd", "addr", "addr", "flags"],
+    "utime": ["path", "addr"],
+    "utimes": ["path", "addr"],
+    "utimensat": ["fd", "path", "addr", "flags"],
     "nanosleep": ["addr", "addr"],
     "clock_gettime": ["clock_id", "addr"],
     "clock_settime": ["clock_id", "addr"],
@@ -670,22 +684,22 @@ SYSCALL_SPECS = {
     "timer_getoverrun": ["random_int"],
     "timer_delete": ["random_int"],
     "timerfd_create": ["clock_id", "flags"],
-    "timerfd_settime": ["fd", "flags", "addr", "addr"],
-    "timerfd_gettime": ["fd", "addr"],
+    "timerfd_settime": ["valid_fd", "flags", "addr", "addr"],
+    "timerfd_gettime": ["valid_fd", "addr"],
     
     # === Process Management ===
     "fork": [],
     "vfork": [],
     "clone": ["clone_flags", "addr", "addr", "addr", "addr"],
     "clone3": ["addr", "size"],
-    "execve": ["addr", "addr", "addr"],
-    "execveat": ["fd", "addr", "addr", "addr", "flags"],
+    "execve": ["path", "addr", "addr"],
+    "execveat": ["fd", "path", "addr", "addr", "flags"],
     "exit": ["random_int"],
     "exit_group": ["random_int"],
     "wait4": ["pid", "addr", "wait_options", "addr"],
     "waitid": ["random_int", "pid", "addr", "wait_options"],
     
-    # === Process Info ===
+    # === Process Info & Credentials ... (no changes in these sections)
     "getpid": [],
     "getppid": [],
     "gettid": [],
@@ -698,8 +712,6 @@ SYSCALL_SPECS = {
     "getsid": ["pid"],
     "setsid": [],
     "setpgid": ["pid", "pid"],
-    
-    # === Process Credentials ===
     "setuid": ["random_int"],
     "setgid": ["random_int"],
     "setreuid": ["random_int", "random_int"],
@@ -710,8 +722,6 @@ SYSCALL_SPECS = {
     "getresgid": ["addr", "addr", "addr"],
     "getgroups": ["random_int", "addr"],
     "setgroups": ["random_int", "addr"],
-    
-    # === Process Control ===
     "prctl": ["prctl_option", "random_int", "random_int", "random_int", "random_int"],
     "setpriority": ["random_int", "random_int", "random_int"],
     "getpriority": ["random_int", "random_int"],
@@ -725,7 +735,7 @@ SYSCALL_SPECS = {
     "sched_getaffinity": ["pid", "size", "addr"],
     "prlimit64": ["pid", "random_int", "addr", "addr"],
     
-    # === Signals ===
+    # === Signals, Networking, I/O Multiplexing ... (no changes in these sections)
     "kill": ["pid", "signal"],
     "tkill": ["pid", "signal"],
     "tgkill": ["pid", "pid", "signal"],
@@ -735,61 +745,49 @@ SYSCALL_SPECS = {
     "rt_sigqueueinfo": ["pid", "signal", "addr"],
     "rt_sigtimedwait": ["addr", "addr", "addr", "size"],
     "sigaltstack": ["addr", "addr"],
-    "signalfd": ["fd", "addr", "size"],
-    "signalfd4": ["fd", "addr", "size", "flags"],
-    
-    # === Networking - Sockets ===
+    "signalfd": ["valid_fd", "addr", "size"],
+    "signalfd4": ["valid_fd", "addr", "size", "flags"],
     "socket": ["socket_domain", "socket_type", "socket_protocol"],
     "socketpair": ["socket_domain", "socket_type", "socket_protocol", "addr"],
-    "connect": ["fd", "addr", "size"],
-    "bind": ["fd", "addr", "size"],
-    "listen": ["fd", "random_int"],
-    "accept": ["fd", "addr", "addr"],
-    "accept4": ["fd", "addr", "addr", "flags"],
-    "getsockname": ["fd", "addr", "addr"],
-    "getpeername": ["fd", "addr", "addr"],
-    "shutdown": ["fd", "random_int"],
-    
-    # === Networking - I/O ===
-    "sendto": ["fd", "addr", "size", "flags", "addr", "size"],
-    "recvfrom": ["fd", "addr", "size", "flags", "addr", "addr"],
-    "sendmsg": ["fd", "addr", "flags"],
-    "recvmsg": ["fd", "addr", "flags"],
-    "sendmmsg": ["fd", "addr", "random_int", "flags"],
-    "recvmmsg": ["fd", "addr", "random_int", "flags", "addr"],
-    
-    # === Networking - Options ===
-    "setsockopt": ["fd", "sockopt_level", "random_int", "addr", "size"],
-    "getsockopt": ["fd", "sockopt_level", "random_int", "addr", "addr"],
-    
-    # === I/O Multiplexing ===
+    "connect": ["valid_fd", "addr", "size"],
+    "bind": ["valid_fd", "addr", "size"],
+    "listen": ["valid_fd", "random_int"],
+    "accept": ["valid_fd", "addr", "addr"],
+    "accept4": ["valid_fd", "addr", "addr", "flags"],
+    "getsockname": ["valid_fd", "addr", "addr"],
+    "getpeername": ["valid_fd", "addr", "addr"],
+    "shutdown": ["valid_fd", "random_int"],
+    "sendto": ["valid_fd", "addr", "size", "flags", "addr", "size"],
+    "recvfrom": ["valid_fd", "addr", "size", "flags", "addr", "addr"],
+    "sendmsg": ["valid_fd", "addr", "flags"],
+    "recvmsg": ["valid_fd", "addr", "flags"],
+    "sendmmsg": ["valid_fd", "addr", "random_int", "flags"],
+    "recvmmsg": ["valid_fd", "addr", "random_int", "flags", "addr"],
+    "setsockopt": ["valid_fd", "sockopt_level", "random_int", "addr", "size"],
+    "getsockopt": ["valid_fd", "sockopt_level", "random_int", "addr", "addr"],
     "select": ["random_int", "addr", "addr", "addr", "addr"],
     "pselect6": ["random_int", "addr", "addr", "addr", "addr", "addr"],
     "poll": ["addr", "random_int", "random_int"],
     "ppoll": ["addr", "random_int", "addr", "addr"],
     "epoll_create": ["random_int"],
     "epoll_create1": ["flags"],
-    "epoll_ctl": ["fd", "random_int", "fd", "addr"],
-    "epoll_wait": ["fd", "addr", "random_int", "random_int"],
-    "epoll_pwait": ["fd", "addr", "random_int", "random_int", "addr"],
-    
-    # === Event Notification ===
+    "epoll_ctl": ["valid_fd", "random_int", "valid_fd", "addr"],
+    "epoll_wait": ["valid_fd", "addr", "random_int", "random_int"],
+    "epoll_pwait": ["valid_fd", "addr", "random_int", "random_int", "addr"],
     "eventfd": ["random_int"],
     "eventfd2": ["random_int", "flags"],
     "inotify_init": [],
     "inotify_init1": ["flags"],
-    "inotify_add_watch": ["fd", "addr", "random_int"],
-    "inotify_rm_watch": ["fd", "random_int"],
+    "inotify_add_watch": ["valid_fd", "path", "random_int"],
+    "inotify_rm_watch": ["valid_fd", "random_int"],
     "fanotify_init": ["flags", "flags"],
-    "fanotify_mark": ["fd", "flags", "random_int", "fd", "addr"],
-    
-    # === Futex ===
+    "fanotify_mark": ["valid_fd", "flags", "random_int", "valid_fd", "path"],
     "futex": ["addr", "random_int", "random_int", "addr", "addr", "random_int"],
     "set_robust_list": ["addr", "size"],
     "get_robust_list": ["pid", "addr", "addr"],
     "set_tid_address": ["addr"],
     
-    # === System V IPC ===
+    # === System V IPC === (no changes)
     "shmget": ["random_int", "size", "flags"],
     "shmat": ["random_int", "addr", "flags"],
     "shmdt": ["addr"],
@@ -801,38 +799,38 @@ SYSCALL_SPECS = {
     "msgsnd": ["random_int", "addr", "size", "flags"],
     "msgrcv": ["random_int", "addr", "size", "random_int", "flags"],
     "msgctl": ["random_int", "random_int", "addr"],
-    
+
     # === Special Files ===
-    "mknod": ["addr", "mode", "random_int"],
-    "mknodat": ["fd", "addr", "mode", "random_int"],
+    "mknod": ["path", "mode", "random_int"],
+    "mknodat": ["fd", "path", "mode", "random_int"],
     
-    # === Advanced/Kernel ===
+    # === Advanced/Kernel ... (no changes)
     "ptrace": ["ptrace_req_cve", "pid", "addr", "addr"],
     "bpf": ["bpf_cmd", "addr", "size"],
     "keyctl": ["keyctl_cmd", "random_int", "random_int", "random_int", "random_int"],
     "userfaultfd": ["userfaultfd_flags"],
     "seccomp": ["seccomp_flags", "flags", "addr"],
-    "perf_event_open": ["addr", "pid", "cpu", "fd", "flags"],
+    "perf_event_open": ["addr", "pid", "cpu", "valid_fd", "flags"],
     "io_uring_setup": ["random_int", "addr"],
-    "io_uring_enter": ["fd", "random_int", "random_int", "flags", "addr", "size"],
-    "io_uring_register": ["fd", "random_int", "addr", "random_int"],
+    "io_uring_enter": ["valid_fd", "random_int", "random_int", "flags", "addr", "size"],
+    "io_uring_register": ["valid_fd", "random_int", "addr", "random_int"],
     
     # === Namespaces ===
     "unshare": ["flags"],
-    "setns": ["fd", "flags"],
+    "setns": ["valid_fd", "flags"],
     "kcmp": ["pid", "pid", "random_int", "random_int", "random_int"],
     "pidfd_open": ["pid", "flags"],
-    "pidfd_send_signal": ["fd", "signal", "addr", "flags"],
-    "pidfd_getfd": ["fd", "fd", "flags"],
+    "pidfd_send_signal": ["valid_fd", "signal", "addr", "flags"],
+    "pidfd_getfd": ["valid_fd", "valid_fd", "flags"],
     
     # === Mount ===
-    "mount": ["addr", "addr", "addr", "mount_flags", "addr"],
-    "umount2": ["addr", "flags"],
-    "pivot_root": ["addr", "addr"],
+    "mount": ["path", "path", "path", "mount_flags", "addr"],
+    "umount2": ["path", "flags"],
+    "pivot_root": ["path", "path"],
     
     # === Modules ===
     "init_module": ["addr", "size", "addr"],
-    "finit_module": ["fd", "addr", "flags"],
+    "finit_module": ["valid_fd", "addr", "flags"],
     "delete_module": ["addr", "flags"],
     
     # === Capabilities ===
@@ -849,9 +847,9 @@ SYSCALL_SPECS = {
     # === Misc ===
     "ioperm": ["random_int", "random_int", "random_int"],
     "iopl": ["random_int"],
-    "quotactl": ["random_int", "addr", "random_int", "addr"],
+    "quotactl": ["random_int", "path", "random_int", "addr"],
     "lookup_dcookie": ["random_int", "addr", "size"],
-    "name_to_handle_at": ["fd", "addr", "addr", "addr", "flags"],
+    "name_to_handle_at": ["fd", "path", "addr", "addr", "flags"],
     "open_by_handle_at": ["fd", "addr", "flags"],
     "reboot": ["random_int", "random_int", "random_int", "addr"],
 }
@@ -859,71 +857,105 @@ SYSCALL_SPECS = {
 # -----------------------
 # Syscall Sequences
 # -----------------------
-SYSCALL_SEQUENCES = {
+SSYSCALL_SEQUENCES = {
+    # --- Original Sequences (Corrected for Stateful Fuzzing) ---
     "uaf_double_close": [
-        {"action": "open", "args": ["addr", "open_flags", "mode"], "result": "fd1"},
+        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o101}, {"literal": 0o644}], "result": "fd1"},
         {"action": "close", "args": [{"value": "fd1"}]},
         {"action": "close", "args": [{"value": "fd1"}]}
     ],
-    
     "uaf_use_after_close": [
-        {"action": "open", "args": ["addr", "open_flags", "mode"], "result": "fd1"},
+        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o101}, {"literal": 0o644}], "result": "fd1"},
         {"action": "close", "args": [{"value": "fd1"}]},
         {"action": "write", "args": [{"value": "fd1"}, "addr", "size"]}
     ],
-    
     "race_dup_close": [
-        {"action": "open", "args": ["addr", "open_flags", "mode"], "result": "fd1"},
+        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o101}, {"literal": 0o644}], "result": "fd1"},
         {"action": "dup", "args": [{"value": "fd1"}], "result": "fd2"},
         {"action": "close", "args": [{"value": "fd1"}]},
         {"action": "write", "args": [{"value": "fd2"}, "addr", "size"]}
     ],
-    
-    "pipe_uaf": [
-        {"action": "pipe", "args": ["addr"], "result": "pipe_fd"},
-        {"action": "close", "args": [{"value": "pipe_fd"}]},
-        {"action": "write", "args": [{"value": "pipe_fd"}, "addr", "size"]}
-    ],
-    ## Race conditions and memory corruption patterns
-    # Double free pattern
     "double_free_mmap": [
-        {"action": "mmap", "args": ["addr", "size", "mmap_prot", "mmap_flags", "fd", "offset"], "result": "map_addr"},
+        {"action": "mmap", "args": ["addr", "size", "mmap_prot", "mmap_flags", {"literal": -1}, {"literal": 0}], "result": "map_addr"},
         {"action": "munmap", "args": [{"value": "map_addr"}, "size"]},
-        {"action": "munmap", "args": [{"value": "map_addr"}, "size"]},  # Double free
+        {"action": "munmap", "args": [{"value": "map_addr"}, "size"]},
     ],
-    
-    # Use-after-munmap
     "uaf_mmap": [
-        {"action": "mmap", "args": ["addr", "size", "mmap_prot", "mmap_flags", "fd", "offset"], "result": "map_addr"},
+        {"action": "mmap", "args": ["addr", "size", "mmap_prot", "mmap_flags", {"literal": -1}, {"literal": 0}], "result": "map_addr"},
         {"action": "munmap", "args": [{"value": "map_addr"}, "size"]},
-        {"action": "mprotect", "args": [{"value": "map_addr"}, "size", "mmap_prot"]},  # Use after free
+        {"action": "mprotect", "args": [{"value": "map_addr"}, "size", "mmap_prot"]},
     ],
-    
-    # Integer overflow in size calculations
     "size_overflow": [
-        {"action": "mmap", "args": ["addr", {"literal": 0xFFFFFFFF}, "mmap_prot", "mmap_flags", "fd", "offset"], "result": "map_addr"},
+        {"action": "mmap", "args": ["addr", {"literal": 0xFFFFFFFF}, "mmap_prot", "mmap_flags", {"literal": -1}, {"literal": 0}], "result": "map_addr"},
     ],
-    
-    # Overlapping memory operations
     "overlap_race": [
-        {"action": "mmap", "args": [{"literal": 0x10000}, {"literal": 0x2000}, "mmap_prot", "mmap_flags", "fd", "offset"], "result": "map1"},
-        {"action": "mmap", "args": [{"literal": 0x11000}, {"literal": 0x2000}, "mmap_prot", "mmap_flags", "fd", "offset"], "result": "map2"},
-        {"action": "munmap", "args": [{"literal": 0x10000}, {"literal": 0x3000}]},  # Overlapping unmap
+        {"action": "mmap", "args": [{"literal": 0x10000}, {"literal": 0x2000}, "mmap_prot", "mmap_flags", {"literal": -1}, {"literal": 0}], "result": "map1"},
+        {"action": "mmap", "args": [{"literal": 0x11000}, {"literal": 0x2000}, "mmap_prot", "mmap_flags", {"literal": -1}, {"literal": 0}], "result": "map2"},
+        {"action": "munmap", "args": [{"literal": 0x10000}, {"literal": 0x3000}]},
     ],
-        "negative_offset_read": [
-        {"action": "open", "args": ["addr", "open_flags", "mode"], "result": "fd"},
+    "negative_offset_read": [
+        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o101}, {"literal": 0o644}], "result": "fd"},
         {"action": "lseek", "args": [{"value": "fd"}, {"literal": -1}, {"literal": 0}]},
         {"action": "read", "args": [{"value": "fd"}, "addr", "size"]},
     ],
-    
     "huge_allocation": [
-        {"action": "mmap", "args": ["addr", {"literal": 0x7FFFFFFF}, "mmap_prot", "mmap_flags", "fd", "offset"]},
+        {"action": "mmap", "args": ["addr", {"literal": 0x7FFFFFFF}, "mmap_prot", "mmap_flags", {"literal": -1}, {"literal": 0}]},
     ],
-    
     "fd_confusion": [
-        {"action": "open", "args": ["addr", "open_flags", "mode"], "result": "fd1"},
+        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o101}, {"literal": 0o644}], "result": "fd1"},
         {"action": "dup2", "args": [{"value": "fd1"}, {"literal": 100}], "result": "fd2"},
         {"action": "close", "args": [{"value": "fd1"}]},
         {"action": "write", "args": [{"literal": 100}, "addr", "size"]},
+    ],
+
+    # --- Advanced UAF & Race Conditions ---
+    "socket_uaf": [
+        {"action": "socket", "args": ["socket_domain", "socket_type", "socket_protocol"], "result": "sock_fd"},
+        {"action": "close", "args": [{"value": "sock_fd"}]},
+        {"action": "sendto", "args": [{"value": "sock_fd"}, "addr", "size", "flags", "addr", "size"]}
+    ],
+    "epoll_race": [
+        {"action": "epoll_create1", "args": ["flags"], "result": "epoll_fd"},
+        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o101}, {"literal": 0o644}], "result": "target_fd"},
+        {"action": "epoll_ctl", "args": [{"value": "epoll_fd"}, {"literal": 1}, {"value": "target_fd"}, "addr"]},
+        {"action": "close", "args": [{"value": "target_fd"}]},
+        {"action": "epoll_wait", "args": [{"value": "epoll_fd"}, "addr", {"literal": 1}, {"literal": 0}]}
+    ],
+    "mmap_munmap_race": [
+        {"action": "mmap", "args": ["addr", "size", "mmap_prot", "mmap_flags", {"literal": -1}, {"literal": 0}], "result": "map_addr"},
+        {"action": "munmap", "args": [{"value": "map_addr"}, "size"]},
+        {"action": "mprotect", "args": [{"value": "map_addr"}, "size", "mmap_prot"]}
+    ],
+    "bpf_uaf": [
+        # BPF_MAP_CREATE = 0
+        {"action": "bpf", "args": [{"literal": 0}, "addr", {"literal": 28}], "result": "bpf_fd"},
+        {"action": "close", "args": [{"value": "bpf_fd"}]},
+        # BPF_MAP_LOOKUP_ELEM = 1
+        {"action": "bpf", "args": [{"literal": 1}, {"value": "bpf_fd"}, "addr"]}
+    ],
+    "timer_uaf": [
+        # CLOCK_MONOTONIC = 1
+        {"action": "timer_create", "args": [{"literal": 1}, "addr", "addr"], "result": "timer_id"},
+        {"action": "timer_delete", "args": [{"value": "timer_id"}]},
+        {"action": "timer_settime", "args": [{"value": "timer_id"}, "flags", "addr", "addr"]}
+    ],
+
+    # --- Kernel Subsystem Logic Tests ---
+    "seccomp_ptrace_bypass": [
+        {"action": "seccomp", "args": ["seccomp_flags", "flags", "addr"]},
+        {"action": "ptrace", "args": ["ptrace_req_cve", "pid", "addr", "addr"]},
+    ],
+    "mount_panic_test": [
+        # CLONE_NEWNS = 0x00020000 (for mount namespace)
+        {"action": "unshare", "args": [{"literal": 0x20000}]},
+        {"action": "mount", "args": ["path", "/tmp", "path", "mount_flags", "addr"]},
+    ],
+    "memfd_seal_bypass": [
+        {"action": "memfd_create", "args": ["addr", "flags"], "result": "memfd"},
+        {"action": "write", "args": [{"value": "memfd"}, "addr", "size"]},
+        # F_ADD_SEALS = 1033
+        {"action": "fcntl", "args": [{"value": "memfd"}, {"literal": 1033}, "random_int"]},
+        # Try to bypass the seal by truncating the file.
+        {"action": "ftruncate", "args": [{"value": "memfd"}, "size"]}
     ],
 }
