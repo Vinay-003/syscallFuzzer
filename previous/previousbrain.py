@@ -4,7 +4,7 @@ import os
 import random
 from datetime import datetime
 # Import the new targeted configuration
-from fuzzer_config import SYSCALL_SPECS, SYSCALL_SEQUENCES, TYPE_GENERATORS
+from old.fuzzer_config import SYSCALL_SPECS, SYSCALL_SEQUENCES, TYPE_GENERATORS
 
 # --- Configuration ---
 VM_DISK_IMAGE = "../alpine.qcow2"
