@@ -19,6 +19,7 @@ import signal
 import sys
 from datetime import datetime
 from pathlib import Path
+import shutil 
 
 # Import configuration
 from fuzzer_brain import SYSCALL_SPECS, SYSCALL_SEQUENCES, TYPE_GENERATORS
@@ -76,13 +77,14 @@ class CrashLogger:
         self.crashes_dir = Path(crashes_dir)
         self.crashes_dir.mkdir(exist_ok=True)
     
-    def log_crash(self, reproducer_commands, crash_context=None):
+    def log_crash(self, reproducer_commands, crash_context=None, console_log_path=None):
         """
         Save comprehensive crash information
         
         Args:
             reproducer_commands: Command(s) that caused the crash
             crash_context: Additional context (dict with metadata)
+            console_log_path: Path to the VM's console log file
         """
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         crash_dir = self.crashes_dir / f"crash_{timestamp}"
@@ -135,10 +137,18 @@ class CrashLogger:
                 f.write("\n--- Additional Context ---\n")
                 for key, value in crash_context.items():
                     f.write(f"{key}: {value}\n")
+
+        # Save the console log for analysis
+        if console_log_path and console_log_path.exists():
+            try:
+                shutil.copy(console_log_path, crash_dir / "console.log")
+                print(f"[+] Saved VM console log to: {crash_dir / 'console.log'}")
+            except Exception as e:
+                print(f"[!] Failed to copy console log: {e}")
         
         print(f"[+] Crash artifacts saved to: {crash_dir}")
         return crash_dir
-    
+   
     def collect_vm_logs(self, ssh_runner, crash_dir):
         """Collect dmesg and other logs from VM"""
         print("[*] Collecting VM logs...")
@@ -299,19 +309,25 @@ class VMManager:
     def __init__(self, ssh_runner):
         self.ssh_runner = ssh_runner
         self.vm_process = None
+        # --- NEW ---
+        self.console_log_path = Path("console.log")
+        self.console_log_file = None
     
     def start_vm(self):
         """Start VM and wait for SSH readiness"""
         print("[*] Starting VM...")
         
         try:
+            self.console_log_file = open(self.console_log_path, "wb")
             self.vm_process = subprocess.Popen(
                 Config.get_qemu_command(),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
+                stdout=self.console_log_file,
+                stderr=self.console_log_file
             )
         except Exception as e:
             print(f"[!] Failed to start VM: {e}")
+            if self.console_log_file:
+                self.console_log_file.close()
             return False
         
         print(f"[+] VM started (PID: {self.vm_process.pid})")
@@ -357,6 +373,8 @@ class VMManager:
     def shutdown_vm(self, force=False):
         """Gracefully shutdown VM"""
         if not self.vm_process:
+            if self.console_log_file: # --- NEW ---
+                self.console_log_file.close() # --- NEW ---
             return
         
         if force:
@@ -372,6 +390,8 @@ class VMManager:
                 print("[!] Graceful shutdown timeout, forcing...")
                 self.vm_process.terminate()
         
+        if self.console_log_file:
+            self.console_log_file.close()
         self.vm_process = None
         print("[+] VM stopped")
     
@@ -396,10 +416,11 @@ class FuzzingEngine:
     # Regex to parse executor output
     # RE_SYSCALL_RET = re.compile(r"syscall\((\d+)\)\s*=\s*(-?\d+)")
     
-    def __init__(self, ssh_runner, crash_logger):
+    def __init__(self, ssh_runner, crash_logger, vm_manager): # <-- MODIFIE
         self.ssh_runner = ssh_runner
         self.crash_logger = crash_logger
         self.iteration = 0
+        self.vm_manager = vm_manager # <-- ADD THIS
         # --- ADD THIS BLOCK ---
         self.corpus_dir = Path("corpus")
         self.corpus_dir.mkdir(exist_ok=True)
@@ -545,11 +566,14 @@ class FuzzingEngine:
                 # Command failed - potential crash
                 return False, commands
             
-            # Store result in environment if requested
-            ret_val = self.parse_executor_output(result.stdout)
+            # --- THIS IS THE CORRECTED LOGIC ---
+            # Parse both return value and coverage from the output
+            ret_val, coverage = self.parse_executor_output(result.stdout)
+            
+            # Store ONLY the return value in the environment if requested
             if step.get("result"):
                 result_var = step["result"]
-                env[result_var] = ret_val if ret_val is not None else 0
+                env[result_var] = ret_val if ret_val is not None else -1
                 print(f"    → {result_var} = {env[result_var]}")
         
         print(f"[+] Sequence '{sequence_name}' completed successfully")
@@ -563,9 +587,8 @@ class FuzzingEngine:
         print('=' * 70)
         
         # Decide: single syscall or sequence?
-        # Note: We are only implementing coverage feedback for single syscalls for now.
         if random.random() < Config.SEQUENCE_PROBABILITY and SYSCALL_SEQUENCES:
-            # Execute sequence (original logic)
+            # Execute sequence
             sequence_name, steps = random.choice(list(SYSCALL_SEQUENCES.items()))
             success, commands = self.execute_sequence(sequence_name, steps)
             
@@ -582,7 +605,8 @@ class FuzzingEngine:
                         "sequence_name": sequence_name,
                         "iteration": self.iteration,
                         "stats": self.stats.copy()
-                    }
+                    },
+                    console_log_path=self.vm_manager.console_log_path
                 )
                 self.crash_logger.collect_vm_logs(self.ssh_runner, crash_dir)
                 return False
@@ -597,21 +621,16 @@ class FuzzingEngine:
             
             self.stats["total_syscalls"] += 1
             
-            # --- THIS IS THE CORE LOGIC FOR COVERAGE FEEDBACK ---
             if success and coverage is not None and coverage > 0:
-                # We use a simple hash of the coverage value for this example.
-                # In a real-world fuzzer, you'd process the full coverage buffer.
                 if coverage not in self.coverage:
                     print(f"\n{'*' * 25} NEW COVERAGE FOUND! ({coverage}) {'*' * 25}")
                     self.coverage.add(coverage)
                     self.stats["new_coverage"] += 1
                     
-                    # Save the input that generated new coverage to the corpus
                     corpus_filename = self.corpus_dir / f"coverage_{coverage}_iter_{self.iteration}"
                     with open(corpus_filename, "w") as f:
                         f.write(command)
                     print(f"[+] Saved new input to: {corpus_filename}")
-            # --- END OF CORE LOGIC ---
             
             if not success:
                 # Crash detected
@@ -625,7 +644,8 @@ class FuzzingEngine:
                         "iteration": self.iteration,
                         "coverage": coverage,
                         "stats": self.stats.copy()
-                    }
+                    },
+                    console_log_path=self.vm_manager.console_log_path
                 )
                 self.crash_logger.collect_vm_logs(self.ssh_runner, crash_dir)
                 return False
@@ -634,7 +654,6 @@ class FuzzingEngine:
                 print(f"[+] Return value: {ret_val} | Coverage: {coverage}")
         
         return True
-    
     def run_session(self):
         """Run a complete fuzzing session until crash or interruption"""
         print("\n" + "#" * 70)
@@ -762,7 +781,8 @@ def main():
     print("\n" + "#" * 70)
     print(f"{'READY TO FUZZ':^70}")
     print("#" * 70)
-    
+
+    fuzzing_engine = FuzzingEngine(ssh_runner, crash_logger, vm_manager) # <-- MODIFIED
     try:
         while True:
             # Start fresh VM
@@ -771,7 +791,7 @@ def main():
                 break
             
             # Create fuzzing engine for this session
-            fuzzing_engine = FuzzingEngine(ssh_runner, crash_logger)
+            # fuzzing_engine = FuzzingEngine(ssh_runner, crash_logger)
             
             # Run fuzzing session
             user_interrupted = fuzzing_engine.run_session()
