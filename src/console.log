@@ -1,12 +1,0 @@
-c[?7l[2J[0mSeaBIOS (version 1.16.3-debian-1.16.3-2)
-
-
-iPXE (https://ipxe.org) 00:03.0 CA00 PCI2.10 PnP PMM+3EFCAF30+3EF0AF30 CA00
-Press Ctrl-B to configure iPXE (PCI 00:03.0)...                                                                               
-
-
-Booting from Hard Disk...
-
-SYSLINUX 6.04 EDD 6.04-pre1 Copyright (C) 1994-2015 H. Peter Anvin et al
-[2J[23;16HAlpine will be booted automatically in [0;1m1[0m seconds.[23;16H                                                  
-qemu-system-x86_64: terminating on signal 1 from pid 12450 ()
