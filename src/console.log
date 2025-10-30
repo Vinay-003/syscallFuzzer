@@ -9,4 +9,4 @@ Booting from Hard Disk...
 
 SYSLINUX 6.04 EDD 6.04-pre1 Copyright (C) 1994-2015 H. Peter Anvin et al
 [2J[23;16HAlpine will be booted automatically in [0;1m1[0m seconds.[23;16H                                                  
-c[?7l[2Jqemu-system-x86_64: terminating on signal 1 from pid 67275 ()
+qemu-system-x86_64: terminating on signal 1 from pid 12450 ()

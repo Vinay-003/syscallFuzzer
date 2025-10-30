@@ -1,12 +1,13 @@
 /*
- * executor.c - Production Syscall Fuzzer Executor
- * * Features:
+ * executor.c - Coverage-Guided Syscall Fuzzer Executor
+ * 
+ * Features:
+ * - KCOV-based code coverage collection
  * - Comprehensive syscall coverage (200+ syscalls)
  * - Robust argument parsing with hex/decimal/octal support
- * - Safety checks and error handling
+ * - Safety limits to prevent system exhaustion
  * - Clean output format for fuzzer parsing
- * - Resource limits to prevent system hang
- * - KCOV coverage collection
+ * - Proper error handling and reporting
  */
 
 #include <stdio.h>
@@ -27,86 +28,171 @@
 
 #define MAX_ARGS 6
 #define MAX_SYSCALL_NAME 64
+
+// Resource limits
 #define MAX_MEMORY_MB 512
 #define MAX_CPU_SECONDS 5
 #define MAX_FILE_SIZE_MB 100
 
+// KCOV configuration
 #define KCOV_COVER_SIZE (256 * 1024)
 #define KCOV_TRACE_PC 0
 
+// KCOV ioctl commands
 #define KCOV_INIT_TRACE _IOR('c', 1, unsigned long)
 #define KCOV_ENABLE _IO('c', 100)
 #define KCOV_DISABLE _IO('c', 101)
 
+// Global KCOV state
 static int kcov_fd = -1;
 static unsigned long *kcov_cover = NULL;
+static int kcov_available = 0;
 
 // ============================================================================
-// KCOV SETUP FUNCTION
+// KCOV INITIALIZATION
 // ============================================================================
 
+/**
+ * Initialize KCOV for code coverage collection
+ * 
+ * KCOV provides kernel code coverage by tracking which code paths
+ * are executed during syscalls. This is essential for coverage-guided fuzzing.
+ */
 static void init_kcov(void) {
+    // Attempt to open KCOV device
     kcov_fd = open("/sys/kernel/debug/kcov", O_RDWR);
     if (kcov_fd == -1) {
-        perror("Failed to open /sys/kernel/debug/kcov");
+        fprintf(stderr, "Warning: Failed to open /sys/kernel/debug/kcov: %s\n", strerror(errno));
+        fprintf(stderr, "Coverage tracking will not be available.\n");
         return;
     }
+    
+    // Initialize KCOV trace buffer
     if (ioctl(kcov_fd, KCOV_INIT_TRACE, KCOV_COVER_SIZE)) {
-        perror("KCOV_INIT_TRACE ioctl failed");
+        fprintf(stderr, "Warning: KCOV_INIT_TRACE ioctl failed: %s\n", strerror(errno));
         close(kcov_fd);
         kcov_fd = -1;
         return;
     }
-    kcov_cover = (unsigned long *)mmap(NULL, KCOV_COVER_SIZE * sizeof(unsigned long),
-                                        PROT_READ | PROT_WRITE, MAP_SHARED, kcov_fd, 0);
+    
+    // Memory map the coverage buffer
+    kcov_cover = (unsigned long *)mmap(
+        NULL, 
+        KCOV_COVER_SIZE * sizeof(unsigned long),
+        PROT_READ | PROT_WRITE, 
+        MAP_SHARED, 
+        kcov_fd, 
+        0
+    );
+    
     if (kcov_cover == MAP_FAILED) {
-        perror("mmap failed");
+        fprintf(stderr, "Warning: KCOV mmap failed: %s\n", strerror(errno));
         close(kcov_fd);
         kcov_fd = -1;
         kcov_cover = NULL;
         return;
     }
-    printf("KCOV initialized successfully.\n");
+    
+    kcov_available = 1;
+    printf("KCOV initialized successfully (buffer size: %d entries).\n", KCOV_COVER_SIZE);
+}
+
+/**
+ * Enable KCOV coverage collection for the current thread
+ */
+static inline void kcov_enable(void) {
+    if (kcov_fd != -1 && kcov_cover != NULL) {
+        // Reset counter before enabling
+        __atomic_store_n(&kcov_cover[0], 0, __ATOMIC_RELAXED);
+        ioctl(kcov_fd, KCOV_ENABLE, KCOV_TRACE_PC);
+    }
+}
+
+/**
+ * Disable KCOV coverage collection and return count
+ * 
+ * Returns: Number of unique program counters (PCs) covered
+ */
+static inline unsigned long kcov_disable(void) {
+    unsigned long coverage_count = 0;
+    
+    if (kcov_fd != -1 && kcov_cover != NULL) {
+        ioctl(kcov_fd, KCOV_DISABLE, 0);
+        // First element contains the number of PCs covered
+        coverage_count = __atomic_load_n(&kcov_cover[0], __ATOMIC_RELAXED);
+    }
+    
+    return coverage_count;
 }
 
 // ============================================================================
-// UTILITY & SYSCALL MAPPING FUNCTIONS (Unchanged)
-// ============================================================================
-// ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
-static long parse_arg(const char *arg) { /* ... (same as before) ... */ 
-    if (!arg || *arg == '\0') return 0;
+
+/**
+ * Parse argument string to long integer
+ * Supports decimal, hexadecimal (0x prefix), and octal (0 prefix)
+ */
+static long parse_arg(const char *arg) {
+    if (!arg || *arg == '\0') 
+        return 0;
+    
     char *endptr;
-    long value = strtol(arg, &endptr, 0);
-    if (endptr == arg) return 0;
+    long value = strtol(arg, &endptr, 0);  // Auto-detect base
+    
+    // If no conversion was performed, return 0
+    if (endptr == arg) 
+        return 0;
+    
     return value;
 }
-static void set_safety_limits(void) { /* ... (same as before) ... */
+
+/**
+ * Set resource limits to prevent system exhaustion
+ */
+static void set_safety_limits(void) {
     struct rlimit rlim;
+    
+    // Limit virtual memory
     rlim.rlim_cur = (rlim_t)MAX_MEMORY_MB * 1024 * 1024;
     rlim.rlim_max = (rlim_t)MAX_MEMORY_MB * 1024 * 1024;
     setrlimit(RLIMIT_AS, &rlim);
+    
+    // Limit CPU time
     rlim.rlim_cur = MAX_CPU_SECONDS;
     rlim.rlim_max = MAX_CPU_SECONDS;
     setrlimit(RLIMIT_CPU, &rlim);
+    
+    // Limit file size
     rlim.rlim_cur = (rlim_t)MAX_FILE_SIZE_MB * 1024 * 1024;
     rlim.rlim_max = (rlim_t)MAX_FILE_SIZE_MB * 1024 * 1024;
     setrlimit(RLIMIT_FSIZE, &rlim);
+    
+    // Disable core dumps
     rlim.rlim_cur = 0;
     rlim.rlim_max = 0;
     setrlimit(RLIMIT_CORE, &rlim);
 }
-static void timeout_handler(int signum) { /* ... (same as before) ... */
+
+/**
+ * Signal handler for timeouts
+ */
+static void timeout_handler(int signum) {
     (void)signum;
     fprintf(stderr, "Timeout: syscall took too long\n");
-    _exit(124);
+    _exit(124);  // Special exit code for timeout
 }
 
 // ============================================================================
-// SYSCALL NAME TO NUMBER MAPPING
+// SYSCALL NAME TO NUMBER MAPPING (COMPLETE)
 // ============================================================================
 
+/**
+ * Resolve syscall name to syscall number
+ * Supports 200+ Linux syscalls across all categories
+ * 
+ * Returns: syscall number on success, -1 if unknown
+ */
 static long resolve_syscall(const char *name) {
     // === Memory Management ===
     if (strcmp(name, "mmap") == 0) return SYS_mmap;
@@ -868,15 +954,15 @@ static long resolve_syscall(const char *name) {
     return -1;
 }
 
-
-
 // ============================================================================
 // MAIN EXECUTION
 // ============================================================================
 
 int main(int argc, char *argv[]) {
+    // Initialize KCOV for coverage tracking
     init_kcov();
 
+    // Validate command-line arguments
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <syscall_name> [arg1] [arg2] ... [arg6]\n", argv[0]);
         return 1;
@@ -888,23 +974,30 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // Resolve syscall name to number
     long syscall_num = resolve_syscall(syscall_name);
     if (syscall_num == -1) {
         fprintf(stderr, "Error: Unknown syscall '%s'\n", syscall_name);
         return 1;
     }
 
+    // Parse arguments (up to MAX_ARGS)
     long args[MAX_ARGS] = {0};
     int num_args = argc - 2;
     if (num_args > MAX_ARGS) num_args = MAX_ARGS;
+    
     for (int i = 0; i < num_args; i++) {
         args[i] = parse_arg(argv[i + 2]);
     }
 
+    // Apply safety limits to prevent resource exhaustion
     set_safety_limits();
+    
+    // Set up timeout handler for long-running syscalls
     signal(SIGALRM, timeout_handler);
     alarm(MAX_CPU_SECONDS);
 
+    // Print what we're about to execute (for logging)
     printf("Fuzzing attempt: %s(", syscall_name);
     for (int i = 0; i < num_args; i++) {
         printf("0x%lx%s", args[i], (i == num_args - 1) ? "" : ", ");
@@ -912,43 +1005,37 @@ int main(int argc, char *argv[]) {
     printf(")\n");
     fflush(stdout);
 
-    // --- NEW: ENABLE KCOV & EXECUTE ---
-    if (kcov_fd != -1) {
-        // Enable coverage collection for this thread
-        ioctl(kcov_fd, KCOV_ENABLE, KCOV_TRACE_PC);
-        // The first element of the buffer is the number of PCs.
-        // We reset it to 0 before the syscall.
-        __atomic_store_n(&kcov_cover[0], 0, __ATOMIC_RELAXED);
-    }
+    // Enable KCOV coverage collection
+    kcov_enable();
 
+    // Execute the syscall
     errno = 0;
     long ret = syscall(syscall_num, args[0], args[1], args[2], args[3], args[4], args[5]);
     int saved_errno = errno;
 
-    unsigned long coverage_count = 0;
-    if (kcov_fd != -1) {
-        // Disable coverage collection for this thread
-        ioctl(kcov_fd, KCOV_DISABLE, 0);
-        // Read the number of covered PCs from the buffer
-        coverage_count = __atomic_load_n(&kcov_cover[0], __ATOMIC_RELAXED);
-    }
-    // --- END NEW ---
+    // Disable KCOV and retrieve coverage count
+    unsigned long coverage_count = kcov_disable();
 
-    if (syscall_num == SYS_fork || syscall_num == SYS_vfork) {
-        if (ret == 0) _exit(0);
+    // Special handling for fork/vfork - child process should exit immediately
+    if ((syscall_num == SYS_fork || syscall_num == SYS_vfork) && ret == 0) {
+        _exit(0);
     }
 
+    // Cancel the timeout alarm
     alarm(0);
 
-    // --- NEW: REPORT COVERAGE IN OUTPUT ---
+    // Print result in parseable format for the fuzzer
     printf("syscall(%ld) = %ld", syscall_num, ret);
+    
     if (ret == -1 && saved_errno != 0) {
-        printf(" (errno=%d, coverage=%lu)", saved_errno, coverage_count);
+        // Syscall failed - include errno for analysis
+        printf(" (errno=%d: %s, coverage=%lu)", saved_errno, strerror(saved_errno), coverage_count);
     } else {
+        // Syscall succeeded or returned non-error value
         printf(" (coverage=%lu)", coverage_count);
     }
+    
     printf("\n");
-    // --- END NEW ---
     fflush(stdout);
 
     return 0;
