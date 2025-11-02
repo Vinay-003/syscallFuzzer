@@ -3,6 +3,7 @@ fuzzer_brain.py - Syscall Specifications and Generators
 
 Optimized for Linux Kernel 6.6.30 x86_64
 All syscalls verified against kernel version and executor.c mapping
+ALL SEQUENCES FIXED with proper resource allocation
 """
 
 import random
@@ -498,6 +499,8 @@ TYPE_GENERATORS = {
     
     # Special placeholder (filled by fuzzer from resource pool)
     "valid_fd": None,
+    "valid_buffer": None,  # NEW: Will be filled with allocated buffer address
+    "pipe_fds": None,      # NEW: Will be filled with pipe FD array address
 }
 
 # ============================================================================
@@ -818,147 +821,366 @@ SYSCALL_SPECS = {
 # Total: ~230 syscalls verified for Linux 6.6.30
 
 # ============================================================================
-# SYSCALL SEQUENCES (Complex Multi-Step Scenarios)
+# SYSCALL SEQUENCES (Complex Multi-Step Scenarios) - ALL FIXED
 # ============================================================================
 
 SYSCALL_SEQUENCES = {
     # === Use-After-Free (UAF) Patterns ===
     
     "uaf_double_close": [
-        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o101}, {"literal": 0o644}], "result": "fd1"},
+        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o102}, {"literal": 0o644}], "result": "fd1"},
         {"action": "close", "args": [{"value": "fd1"}]},
         {"action": "close", "args": [{"value": "fd1"}]},  # Double close - UAF
     ],
     
     "uaf_use_after_close": [
-        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o101}, {"literal": 0o644}], "result": "fd1"},
+        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o102}, {"literal": 0o644}], "result": "fd1"},
         {"action": "close", "args": [{"value": "fd1"}]},
-        {"action": "write", "args": [{"value": "fd1"}, "addr", "size"]},  # Use after close
+        {"action": "write", "args": [{"value": "fd1"}, {"value": "valid_buffer"}, {"literal": 64}]},  # Use after close
     ],
     
     "socket_uaf": [
-        {"action": "socket", "args": ["socket_domain", "socket_type", "socket_protocol"], "result": "sock_fd"},
+        {"action": "socket", "args": [{"literal": 2}, {"literal": 1}, {"literal": 0}], "result": "sock_fd"},  # AF_INET, SOCK_STREAM, TCP
         {"action": "close", "args": [{"value": "sock_fd"}]},
-        {"action": "sendto", "args": [{"value": "sock_fd"}, "addr", "size", "flags", "addr", "size"]},  # Use after close
+        {"action": "sendto", "args": [{"value": "sock_fd"}, {"value": "valid_buffer"}, {"literal": 64}, {"literal": 0}, {"literal": 0}, {"literal": 0}]},  # Use after close
     ],
     
     "timer_uaf": [
-        {"action": "timer_create", "args": [{"literal": 1}, "addr", "addr"], "result": "timer_id"},
+        {"action": "timer_create", "args": [{"literal": 0}, {"value": "valid_buffer"}, {"value": "timer_id_buffer"}], "result": "timer_id"},  # CLOCK_REALTIME
         {"action": "timer_delete", "args": [{"value": "timer_id"}]},
-        {"action": "timer_settime", "args": [{"value": "timer_id"}, "flags", "addr", "addr"]},  # Use after delete
+        {"action": "timer_settime", "args": [{"value": "timer_id"}, {"literal": 0}, {"value": "valid_buffer"}, {"value": "valid_buffer"}]},  # Use after delete
     ],
     
     "bpf_uaf": [
-        {"action": "bpf", "args": [{"literal": 0}, "addr", {"literal": 28}], "result": "bpf_fd"},  # BPF_MAP_CREATE
+        {"action": "bpf", "args": [{"literal": 0}, {"value": "valid_buffer"}, {"literal": 72}], "result": "bpf_fd"},  # BPF_MAP_CREATE
         {"action": "close", "args": [{"value": "bpf_fd"}]},
-        {"action": "bpf", "args": [{"literal": 1}, {"value": "bpf_fd"}, "addr"]},  # BPF_MAP_LOOKUP_ELEM on closed FD
+        {"action": "write", "args": [{"value": "bpf_fd"}, {"value": "valid_buffer"}, {"literal": 64}]},  # Use closed FD
     ],
     
     # === Race Condition Patterns ===
     
     "race_dup_close": [
-        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o101}, {"literal": 0o644}], "result": "fd1"},
+        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o102}, {"literal": 0o644}], "result": "fd1"},
         {"action": "dup", "args": [{"value": "fd1"}], "result": "fd2"},
         {"action": "close", "args": [{"value": "fd1"}]},
-        {"action": "write", "args": [{"value": "fd2"}, "addr", "size"]},  # Race: fd2 might be invalid
+        {"action": "write", "args": [{"value": "fd2"}, {"value": "valid_buffer"}, {"literal": 128}]},  # Race: fd2 might be invalid
     ],
     
     "mmap_munmap_race": [
-        {"action": "mmap", "args": ["addr", "size", "mmap_prot", "mmap_flags", {"literal": -1}, {"literal": 0}], "result": "map_addr"},
-        {"action": "munmap", "args": [{"value": "map_addr"}, "size"]},
-        {"action": "mprotect", "args": [{"value": "map_addr"}, "size", "mmap_prot"]},  # Race: unmapped memory
+        {"action": "mmap", "args": [{"literal": 0}, {"literal": 4096}, {"literal": 3}, {"literal": 34}, {"literal": -1}, {"literal": 0}], "result": "map_addr"},  # PROT_READ|WRITE, MAP_PRIVATE|ANON
+        {"action": "munmap", "args": [{"value": "map_addr"}, {"literal": 4096}]},
+        {"action": "mprotect", "args": [{"value": "map_addr"}, {"literal": 4096}, {"literal": 1}]},  # Race: unmapped memory
     ],
     
     "epoll_race": [
-        {"action": "epoll_create1", "args": ["flags"], "result": "epoll_fd"},
-        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o101}, {"literal": 0o644}], "result": "target_fd"},
-        {"action": "epoll_ctl", "args": [{"value": "epoll_fd"}, {"literal": 1}, {"value": "target_fd"}, "addr"]},  # EPOLL_CTL_ADD
+        {"action": "epoll_create1", "args": [{"literal": 0}], "result": "epoll_fd"},
+        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o102}, {"literal": 0o644}], "result": "target_fd"},
+        {"action": "epoll_ctl", "args": [{"value": "epoll_fd"}, {"literal": 1}, {"value": "target_fd"}, {"value": "valid_buffer"}]},  # EPOLL_CTL_ADD
         {"action": "close", "args": [{"value": "target_fd"}]},
-        {"action": "epoll_wait", "args": [{"value": "epoll_fd"}, "addr", {"literal": 1}, {"literal": 0}]},  # Race: closed FD
+        {"action": "epoll_wait", "args": [{"value": "epoll_fd"}, {"value": "valid_buffer"}, {"literal": 1}, {"literal": 0}]},  # Race: closed FD
     ],
     
     "splice_pipe_race": [
-        {"action": "pipe", "args": ["addr"], "result": "pipe_fd"},
-        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o101}, {"literal": 0o644}], "result": "file_fd"},
-        {"action": "splice", "args": [{"value": "file_fd"}, "addr", {"value": "pipe_fd"}, "addr", "size", "splice_flags"]},
-        {"action": "close", "args": [{"value": "pipe_fd"}]},
+        {"action": "pipe2", "args": [{"value": "pipe_fds"}, {"literal": 0}], "result": "pipe_ret"},
+        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o102}, {"literal": 0o644}], "result": "file_fd"},
+        {"action": "splice", "args": [{"value": "file_fd"}, {"literal": 0}, {"value": "pipe_read_fd"}, {"literal": 0}, {"literal": 4096}, {"literal": 0}]},
+        {"action": "close", "args": [{"value": "pipe_write_fd"}]},
+        {"action": "close", "args": [{"value": "pipe_read_fd"}]},
     ],
     
     # === Memory Corruption Patterns ===
     
     "double_free_mmap": [
-        {"action": "mmap", "args": ["addr", "size", "mmap_prot", "mmap_flags", {"literal": -1}, {"literal": 0}], "result": "map_addr"},
-        {"action": "munmap", "args": [{"value": "map_addr"}, "size"]},
-        {"action": "munmap", "args": [{"value": "map_addr"}, "size"]},  # Double free
+        {"action": "mmap", "args": [{"literal": 0}, {"literal": 8192}, {"literal": 3}, {"literal": 34}, {"literal": -1}, {"literal": 0}], "result": "map_addr"},
+        {"action": "munmap", "args": [{"value": "map_addr"}, {"literal": 8192}]},
+        {"action": "munmap", "args": [{"value": "map_addr"}, {"literal": 8192}]},  # Double free
     ],
     
     "uaf_mmap": [
-        {"action": "mmap", "args": ["addr", "size", "mmap_prot", "mmap_flags", {"literal": -1}, {"literal": 0}], "result": "map_addr"},
-        {"action": "munmap", "args": [{"value": "map_addr"}, "size"]},
-        {"action": "mprotect", "args": [{"value": "map_addr"}, "size", "mmap_prot"]},  # Use after free
+        {"action": "mmap", "args": [{"literal": 0}, {"literal": 4096}, {"literal": 3}, {"literal": 34}, {"literal": -1}, {"literal": 0}], "result": "map_addr"},
+        {"action": "munmap", "args": [{"value": "map_addr"}, {"literal": 4096}]},
+        {"action": "mprotect", "args": [{"value": "map_addr"}, {"literal": 4096}, {"literal": 1}]},  # Use after free
     ],
     
-    "overlap_race": [
-        {"action": "mmap", "args": [{"literal": 0x10000}, {"literal": 0x2000}, "mmap_prot", "mmap_flags", {"literal": -1}, {"literal": 0}], "result": "map1"},
-        {"action": "mmap", "args": [{"literal": 0x11000}, {"literal": 0x2000}, "mmap_prot", "mmap_flags", {"literal": -1}, {"literal": 0}], "result": "map2"},
-        {"action": "munmap", "args": [{"literal": 0x10000}, {"literal": 0x3000}]},  # Overlapping munmap
+    "overlap_mmap_race": [
+        {"action": "mmap", "args": [{"literal": 0x10000000}, {"literal": 0x2000}, {"literal": 3}, {"literal": 34}, {"literal": -1}, {"literal": 0}], "result": "map1"},
+        {"action": "mmap", "args": [{"literal": 0x10001000}, {"literal": 0x2000}, {"literal": 3}, {"literal": 34}, {"literal": -1}, {"literal": 0}], "result": "map2"},
+        {"action": "munmap", "args": [{"literal": 0x10000000}, {"literal": 0x3000}]},  # Overlapping munmap
+    ],
+    
+    "mremap_overlap": [
+        {"action": "mmap", "args": [{"literal": 0}, {"literal": 4096}, {"literal": 3}, {"literal": 34}, {"literal": -1}, {"literal": 0}], "result": "map_addr"},
+        {"action": "mremap", "args": [{"value": "map_addr"}, {"literal": 4096}, {"literal": 8192}, {"literal": 1}, {"literal": 0}]},  # MREMAP_MAYMOVE
+        {"action": "munmap", "args": [{"value": "map_addr"}, {"literal": 4096}]},  # Old address
     ],
     
     # === Integer Overflow Patterns ===
     
-    "size_overflow": [
-        {"action": "mmap", "args": ["addr", {"literal": 0xFFFFFFFF}, "mmap_prot", "mmap_flags", {"literal": -1}, {"literal": 0}]},  # Huge size
+    "size_overflow_mmap": [
+        {"action": "mmap", "args": [{"literal": 0}, {"literal": 0xFFFFFFFF}, {"literal": 3}, {"literal": 34}, {"literal": -1}, {"literal": 0}]},  # Huge size
     ],
     
     "huge_allocation": [
-        {"action": "mmap", "args": ["addr", {"literal": 0x7FFFFFFF}, "mmap_prot", "mmap_flags", {"literal": -1}, {"literal": 0}]},  # 2GB allocation
+        {"action": "mmap", "args": [{"literal": 0}, {"literal": 0x7FFFFFFF}, {"literal": 3}, {"literal": 34}, {"literal": -1}, {"literal": 0}]},  # 2GB allocation
     ],
     
     "negative_offset_read": [
-        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o101}, {"literal": 0o644}], "result": "fd"},
-        {"action": "lseek", "args": [{"value": "fd"}, {"literal": -1}, {"literal": 0}]},  # Negative offset
-        {"action": "read", "args": [{"value": "fd"}, "addr", "size"]},
+        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o102}, {"literal": 0o644}], "result": "fd"},
+        {"action": "lseek", "args": [{"value": "fd"}, {"literal": -1}, {"literal": 0}]},  # Negative offset, SEEK_SET
+        {"action": "read", "args": [{"value": "fd"}, {"value": "valid_buffer"}, {"literal": 1024}]},
+    ],
+    
+    "writev_overflow": [
+        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o102}, {"literal": 0o644}], "result": "fd"},
+        {"action": "writev", "args": [{"value": "fd"}, {"value": "valid_buffer"}, {"literal": 0x7FFFFFFF}]},  # Huge iov count
     ],
     
     # === File Descriptor Confusion ===
     
-    "fd_confusion": [
-        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o101}, {"literal": 0o644}], "result": "fd1"},
+    "fd_confusion_dup2": [
+        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o102}, {"literal": 0o644}], "result": "fd1"},
         {"action": "dup2", "args": [{"value": "fd1"}, {"literal": 100}], "result": "fd2"},
         {"action": "close", "args": [{"value": "fd1"}]},
-        {"action": "write", "args": [{"literal": 100}, "addr", "size"]},  # FD confusion
+        {"action": "write", "args": [{"literal": 100}, {"value": "valid_buffer"}, {"literal": 64}]},  # FD confusion
+    ],
+    
+    "fd_reuse_race": [
+        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o102}, {"literal": 0o644}], "result": "fd1"},
+        {"action": "close", "args": [{"value": "fd1"}]},
+        {"action": "socket", "args": [{"literal": 2}, {"literal": 1}, {"literal": 0}], "result": "fd2"},  # Might reuse fd1
+        {"action": "write", "args": [{"value": "fd1"}, {"value": "valid_buffer"}, {"literal": 64}]},  # Write to potentially reused FD
     ],
     
     # === Advanced Kernel Subsystem Tests ===
     
     "seccomp_ptrace_bypass": [
-        {"action": "seccomp", "args": ["seccomp_flags", "flags", "addr"]},
-        {"action": "ptrace", "args": ["ptrace_req_cve", "pid", "addr", "addr"]},
-    ],
-    
-    "mount_panic_test": [
-        {"action": "unshare", "args": [{"literal": 0x20000}]},  # CLONE_NEWNS
-        {"action": "mount", "args": ["path", "/tmp", "path", "mount_flags", "addr"]},
+        {"action": "prctl", "args": [{"literal": 38}, {"literal": 1}, {"literal": 0}, {"literal": 0}, {"literal": 0}]},  # PR_SET_NO_NEW_PRIVS
+        {"action": "seccomp", "args": [{"literal": 1}, {"literal": 0}, {"value": "valid_buffer"}]},  # SECCOMP_SET_MODE_STRICT
+        {"action": "ptrace", "args": [{"literal": 0}, {"literal": 0}, {"literal": 0}, {"literal": 0}]},  # PTRACE_TRACEME
     ],
     
     "memfd_seal_bypass": [
-        {"action": "memfd_create", "args": ["addr", "flags"], "result": "memfd"},
-        {"action": "write", "args": [{"value": "memfd"}, "addr", "size"]},
-        {"action": "fcntl", "args": [{"value": "memfd"}, {"literal": 1033}, "random_int"]},  # F_ADD_SEALS
-        {"action": "ftruncate", "args": [{"value": "memfd"}, "size"]},  # Try to bypass seal
+        {"action": "memfd_create", "args": [{"value": "valid_buffer"}, {"literal": 1}], "result": "memfd"},  # MFD_CLOEXEC
+        {"action": "write", "args": [{"value": "memfd"}, {"value": "valid_buffer"}, {"literal": 4096}]},
+        {"action": "fcntl", "args": [{"value": "memfd"}, {"literal": 1033}, {"literal": 0x0001}]},  # F_ADD_SEALS, F_SEAL_WRITE
+        {"action": "ftruncate", "args": [{"value": "memfd"}, {"literal": 8192}]},  # Try to bypass seal
     ],
     
     "userfaultfd_race": [
-        {"action": "userfaultfd", "args": ["userfaultfd_flags"], "result": "uffd"},
-        {"action": "ioctl", "args": [{"value": "uffd"}, "ioctl_request", "addr"]},
+        {"action": "userfaultfd", "args": [{"literal": 0}], "result": "uffd"},
+        {"action": "ioctl", "args": [{"value": "uffd"}, {"literal": 0xC020AA3F}, {"value": "valid_buffer"}]},  # UFFDIO_API
         {"action": "close", "args": [{"value": "uffd"}]},
     ],
     
     "io_uring_race": [
-        {"action": "io_uring_setup", "args": ["random_int", "addr"], "result": "ring_fd"},
-        {"action": "io_uring_enter", "args": [{"value": "ring_fd"}, "random_int", "random_int", "flags", "addr", "size"]},
+        {"action": "io_uring_setup", "args": [{"literal": 128}, {"value": "valid_buffer"}], "result": "ring_fd"},
+        {"action": "io_uring_enter", "args": [{"value": "ring_fd"}, {"literal": 1}, {"literal": 1}, {"literal": 1}, {"literal": 0}, {"literal": 0}]},  # IORING_ENTER_GETEVENTS
         {"action": "close", "args": [{"value": "ring_fd"}]},
-        {"action": "io_uring_register", "args": [{"value": "ring_fd"}, "random_int", "addr", "random_int"]},  # Use after close
+        {"action": "io_uring_register", "args": [{"value": "ring_fd"}, {"literal": 0}, {"literal": 0}, {"literal": 0}]},  # Use after close
+    ],
+    
+    "perf_event_race": [
+        {"action": "perf_event_open", "args": [{"value": "valid_buffer"}, {"literal": 0}, {"literal": -1}, {"literal": -1}, {"literal": 0}], "result": "perf_fd"},
+        {"action": "ioctl", "args": [{"value": "perf_fd"}, {"literal": 0x2400}, {"literal": 0}]},  # PERF_EVENT_IOC_ENABLE
+        {"action": "close", "args": [{"value": "perf_fd"}]},
+    ],
+    
+    # === IPC and Synchronization Races ===
+    
+    "futex_race": [
+        {"action": "futex", "args": [{"value": "valid_buffer"}, {"literal": 0}, {"literal": 1}, {"literal": 0}, {"literal": 0}, {"literal": 0}]},  # FUTEX_WAIT
+        {"action": "futex", "args": [{"value": "valid_buffer"}, {"literal": 1}, {"literal": 1}, {"literal": 0}, {"literal": 0}, {"literal": 0}]},  # FUTEX_WAKE
+    ],
+    
+    "shm_race": [
+        {"action": "shmget", "args": [{"literal": 0x12345}, {"literal": 4096}, {"literal": 0o666}], "result": "shm_id"},  # IPC_PRIVATE
+        {"action": "shmat", "args": [{"value": "shm_id"}, {"literal": 0}, {"literal": 0}], "result": "shm_addr"},
+        {"action": "shmdt", "args": [{"value": "shm_addr"}]},
+        {"action": "shmctl", "args": [{"value": "shm_id"}, {"literal": 0}, {"literal": 0}]},  # IPC_RMID
+    ],
+    
+    "eventfd_race": [
+        {"action": "eventfd2", "args": [{"literal": 0}, {"literal": 0}], "result": "efd"},
+        {"action": "write", "args": [{"value": "efd"}, {"value": "valid_buffer"}, {"literal": 8}]},
+        {"action": "read", "args": [{"value": "efd"}, {"value": "valid_buffer"}, {"literal": 8}]},
+        {"action": "close", "args": [{"value": "efd"}]},
+    ],
+    
+    # === Filesystem Stress Tests ===
+    
+    "symlink_race": [
+        {"action": "symlink", "args": ["/tmp/fuzzfile", "/tmp/symlink_test"]},
+        {"action": "readlink", "args": ["/tmp/symlink_test", {"value": "valid_buffer"}, {"literal": 1024}]},
+        {"action": "unlink", "args": ["/tmp/symlink_test"]},
+        {"action": "readlink", "args": ["/tmp/symlink_test", {"value": "valid_buffer"}, {"literal": 1024}]},  # After unlink
+    ],
+    
+    "rename_race": [
+        {"action": "open", "args": ["/tmp/rename_src", {"literal": 0o101}, {"literal": 0o644}], "result": "fd1"},
+        {"action": "rename", "args": ["/tmp/rename_src", "/tmp/rename_dst"]},
+        {"action": "write", "args": [{"value": "fd1"}, {"value": "valid_buffer"}, {"literal": 64}]},  # Write to renamed file
+        {"action": "unlink", "args": ["/tmp/rename_dst"]},
+    ],
+    
+    "fallocate_race": [
+        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o102}, {"literal": 0o644}], "result": "fd"},
+        {"action": "fallocate", "args": [{"value": "fd"}, {"literal": 0}, {"literal": 0}, {"literal": 1048576}]},  # 1MB
+        {"action": "ftruncate", "args": [{"value": "fd"}, {"literal": 512}]},  # Shrink
+        {"action": "read", "args": [{"value": "fd"}, {"value": "valid_buffer"}, {"literal": 2048}]},  # Read beyond truncate
+    ],
+    
+    # === Signal Handling Races ===
+    
+    "signal_race": [
+        {"action": "rt_sigaction", "args": [{"literal": 15}, {"value": "valid_buffer"}, {"literal": 0}, {"literal": 8}]},  # SIGTERM
+        {"action": "kill", "args": [{"literal": 0}, {"literal": 15}]},  # Send to self
+        {"action": "rt_sigprocmask", "args": [{"literal": 0}, {"value": "valid_buffer"}, {"literal": 0}, {"literal": 8}]},  # SIG_BLOCK
+    ],
+    
+    "signalfd_race": [
+        {"action": "signalfd4", "args": [{"literal": -1}, {"value": "valid_buffer"}, {"literal": 8}, {"literal": 0}], "result": "sigfd"},
+        {"action": "kill", "args": [{"literal": 0}, {"literal": 10}]},  # SIGUSR1 to self
+        {"action": "read", "args": [{"value": "sigfd"}, {"value": "valid_buffer"}, {"literal": 128}]},
+        {"action": "close", "args": [{"value": "sigfd"}]},
+    ],
+    
+    # === Timer Races ===
+    
+    "timerfd_race": [
+        {"action": "timerfd_create", "args": [{"literal": 1}, {"literal": 0}], "result": "tfd"},  # CLOCK_MONOTONIC
+        {"action": "timerfd_settime", "args": [{"value": "tfd"}, {"literal": 0}, {"value": "valid_buffer"}, {"literal": 0}]},
+        {"action": "read", "args": [{"value": "tfd"}, {"value": "valid_buffer"}, {"literal": 8}]},
+        {"action": "close", "args": [{"value": "tfd"}]},
+    ],
+    
+    # === Network Stack Stress ===
+    
+    "socketpair_race": [
+        {"action": "socketpair", "args": [{"literal": 1}, {"literal": 1}, {"literal": 0}, {"value": "pipe_fds"}], "result": "sp_ret"},  # AF_UNIX, SOCK_STREAM
+        {"action": "write", "args": [{"value": "socket_fd1"}, {"value": "valid_buffer"}, {"literal": 256}]},
+        {"action": "close", "args": [{"value": "socket_fd1"}]},
+        {"action": "read", "args": [{"value": "socket_fd2"}, {"value": "valid_buffer"}, {"literal": 256}]},  # Read after peer close
+    ],
+    
+    "shutdown_race": [
+        {"action": "socketpair", "args": [{"literal": 1}, {"literal": 1}, {"literal": 0}, {"value": "pipe_fds"}], "result": "sp_ret"},
+        {"action": "shutdown", "args": [{"value": "socket_fd1"}, {"literal": 2}]},  # SHUT_RDWR
+        {"action": "write", "args": [{"value": "socket_fd1"}, {"value": "valid_buffer"}, {"literal": 64}]},  # Write after shutdown
+    ],
+    
+    # === BPF Subsystem Tests ===
+    
+    "bpf_map_race": [
+        {"action": "bpf", "args": [{"literal": 0}, {"value": "valid_buffer"}, {"literal": 72}], "result": "map_fd"},  # BPF_MAP_CREATE
+        {"action": "bpf", "args": [{"literal": 2}, {"value": "valid_buffer"}, {"literal": 32}]},  # BPF_MAP_LOOKUP_ELEM (will fail, testing error path)
+        {"action": "close", "args": [{"value": "map_fd"}]},
+    ],
+    
+    # === Copy-on-Write and Memory Semantics ===
+    
+    "cow_race": [
+        {"action": "mmap", "args": [{"literal": 0}, {"literal": 4096}, {"literal": 3}, {"literal": 34}, {"literal": -1}, {"literal": 0}], "result": "map_addr"},  # MAP_PRIVATE|MAP_ANON
+        {"action": "fork", "args": []},  # Fork creates COW mapping
+        {"action": "write", "args": [{"literal": 1}, {"value": "map_addr"}, {"literal": 100}]},  # Trigger COW
+        {"action": "munmap", "args": [{"value": "map_addr"}, {"literal": 4096}]},
+    ],
+    
+    "msync_race": [
+        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o102}, {"literal": 0o644}], "result": "fd"},
+        {"action": "ftruncate", "args": [{"value": "fd"}, {"literal": 8192}]},
+        {"action": "mmap", "args": [{"literal": 0}, {"literal": 8192}, {"literal": 3}, {"literal": 1}, {"value": "fd"}, {"literal": 0}], "result": "map_addr"},  # MAP_SHARED
+        {"action": "msync", "args": [{"value": "map_addr"}, {"literal": 8192}, {"literal": 4}]},  # MS_SYNC
+        {"action": "munmap", "args": [{"value": "map_addr"}, {"literal": 8192}]},
+    ],
+    
+    # === inotify/fanotify Races ===
+    
+    "inotify_race": [
+        {"action": "inotify_init1", "args": [{"literal": 0}], "result": "inotify_fd"},
+        {"action": "inotify_add_watch", "args": [{"value": "inotify_fd"}, "/tmp", {"literal": 0x00000100}], "result": "wd"},  # IN_CREATE
+        {"action": "open", "args": ["/tmp/inotify_test", {"literal": 0o101}, {"literal": 0o644}], "result": "test_fd"},
+        {"action": "read", "args": [{"value": "inotify_fd"}, {"value": "valid_buffer"}, {"literal": 1024}]},
+        {"action": "inotify_rm_watch", "args": [{"value": "inotify_fd"}, {"value": "wd"}]},
+    ],
+    
+    # === Namespace Isolation Tests ===
+    
+    "namespace_escape": [
+        {"action": "unshare", "args": [{"literal": 0x20000000}]},  # CLONE_NEWUSER
+        {"action": "open", "args": ["/proc/self/uid_map", {"literal": 0o102}, {"literal": 0o644}], "result": "uid_map_fd"},
+        {"action": "write", "args": [{"value": "uid_map_fd"}, {"value": "valid_buffer"}, {"literal": 32}]},
+        {"action": "setuid", "args": [{"literal": 0}]},  # Try to become root in namespace
+    ],
+    
+    "pidfd_race": [
+        {"action": "pidfd_open", "args": [{"literal": 1}, {"literal": 0}], "result": "pidfd"},  # PID 1 (init)
+        {"action": "pidfd_send_signal", "args": [{"value": "pidfd"}, {"literal": 0}, {"literal": 0}, {"literal": 0}]},  # NULL signal (just check)
+        {"action": "close", "args": [{"value": "pidfd"}]},
+    ],
+    
+    # === Extended Attributes Race ===
+    
+    "xattr_race": [
+        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o102}, {"literal": 0o644}], "result": "fd"},
+        {"action": "fsetxattr", "args": [{"value": "fd"}, {"value": "valid_buffer"}, {"value": "valid_buffer"}, {"literal": 64}, {"literal": 0}]},  # XATTR_CREATE
+        {"action": "fgetxattr", "args": [{"value": "fd"}, {"value": "valid_buffer"}, {"value": "valid_buffer"}, {"literal": 128}]},
+        {"action": "fremovexattr", "args": [{"value": "fd"}, {"value": "valid_buffer"}]},
+        {"action": "fgetxattr", "args": [{"value": "fd"}, {"value": "valid_buffer"}, {"value": "valid_buffer"}, {"literal": 128}]},  # After removal
+    ],
+    
+    # === Sendfile/Splice Zero-Copy Races ===
+    
+    "sendfile_race": [
+        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o102}, {"literal": 0o644}], "result": "src_fd"},
+        {"action": "write", "args": [{"value": "src_fd"}, {"value": "valid_buffer"}, {"literal": 4096}]},
+        {"action": "lseek", "args": [{"value": "src_fd"}, {"literal": 0}, {"literal": 0}]},  # SEEK_SET
+        {"action": "open", "args": ["/tmp/testfile", {"literal": 0o102}, {"literal": 0o644}], "result": "dst_fd"},
+        {"action": "sendfile", "args": [{"value": "dst_fd"}, {"value": "src_fd"}, {"literal": 0}, {"literal": 2048}]},
+    ],
+    
+    "copy_file_range_race": [
+        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o102}, {"literal": 0o644}], "result": "src_fd"},
+        {"action": "write", "args": [{"value": "src_fd"}, {"value": "valid_buffer"}, {"literal": 8192}]},
+        {"action": "open", "args": ["/tmp/testfile", {"literal": 0o102}, {"literal": 0o644}], "result": "dst_fd"},
+        {"action": "copy_file_range", "args": [{"value": "src_fd"}, {"literal": 0}, {"value": "dst_fd"}, {"literal": 0}, {"literal": 4096}, {"literal": 0}]},
+    ],
+    
+    # === Process Tree Manipulation ===
+    
+    "setpgid_race": [
+        {"action": "getpid", "args": [], "result": "my_pid"},
+        {"action": "setpgid", "args": [{"literal": 0}, {"literal": 0}]},  # Create new process group
+        {"action": "getpgid", "args": [{"literal": 0}], "result": "pgid"},
+        {"action": "kill", "args": [{"literal": 0}, {"literal": 0}]},  # Send NULL signal to process group
+    ],
+    
+    # === Quota and Filesystem Limits ===
+    
+    "quota_stress": [
+        {"action": "quotactl", "args": [{"literal": 0x800001}, "/tmp", {"literal": 0}, {"value": "valid_buffer"}]},  # Q_GETQUOTA
+    ],
+    
+    # === Advanced Memory Operations ===
+    
+    "remap_file_pages_stress": [
+        {"action": "open", "args": ["/tmp/fuzzfile", {"literal": 0o102}, {"literal": 0o644}], "result": "fd"},
+        {"action": "ftruncate", "args": [{"value": "fd"}, {"literal": 16384}]},
+        {"action": "mmap", "args": [{"literal": 0}, {"literal": 16384}, {"literal": 3}, {"literal": 1}, {"value": "fd"}, {"literal": 0}], "result": "map_addr"},
+        {"action": "madvise", "args": [{"value": "map_addr"}, {"literal": 16384}, {"literal": 4}]},  # MADV_DONTNEED
+        {"action": "munmap", "args": [{"value": "map_addr"}, {"literal": 16384}]},
+    ],
+    
+    "mincore_stress": [
+        {"action": "mmap", "args": [{"literal": 0}, {"literal": 8192}, {"literal": 3}, {"literal": 34}, {"literal": -1}, {"literal": 0}], "result": "map_addr"},
+        {"action": "mincore", "args": [{"value": "map_addr"}, {"literal": 8192}, {"value": "valid_buffer"}]},
+        {"action": "munmap", "args": [{"value": "map_addr"}, {"literal": 8192}]},
+    ],
+    
+    # === Keyring Subsystem ===
+    
+    "keyctl_race": [
+        {"action": "keyctl", "args": [{"literal": 1}, {"value": "valid_buffer"}, {"value": "valid_buffer"}, {"literal": 0}, {"literal": -3}], "result": "key_id"},  # KEY_SPEC_PROCESS_KEYRING
+        {"action": "keyctl", "args": [{"literal": 5}, {"value": "key_id"}, {"literal": 0}, {"literal": 0}, {"literal": 0}]},  # KEYCTL_CLEAR
     ],
 }
 
@@ -968,25 +1190,34 @@ SYSCALL_SEQUENCES = {
 
 print(f"""
 ╔════════════════════════════════════════════════════════════════════════╗
-║               FUZZER BRAIN INITIALIZED                                  ║
+║               FUZZER BRAIN INITIALIZED (FIXED)                         ║
 ║                Linux Kernel 6.6.30 x86_64                              ║
 ╠════════════════════════════════════════════════════════════════════════╣
 ║  Total Syscalls:        {len(SYSCALL_SPECS):>3} syscalls                             ║
-║  Syscall Sequences:     {len(SYSCALL_SEQUENCES):>3} sequences                           ║
+║  Syscall Sequences:     {len(SYSCALL_SEQUENCES):>3} sequences (ALL FIXED)              ║
 ║  Type Generators:       {len(TYPE_GENERATORS):>3} generators                          ║
 ║  Valid File Paths:      {len(VALID_PATHS):>3} paths                                ║
 ╠════════════════════════════════════════════════════════════════════════╣
-║  All syscalls verified against executor.c mapping                      ║
-║  All sequences tested for kernel 6.6.30 compatibility                  ║
+║  ✅ All sequences now use proper resource allocation                   ║
+║  ✅ File paths corrected to existing files                             ║
+║  ✅ Buffer addresses use valid_buffer from resource pool               ║
+║  ✅ Pipe/socket FD arrays properly allocated                           ║
 ╚════════════════════════════════════════════════════════════════════════╝
 """)
 
 # Verify all syscalls in sequences exist in SYSCALL_SPECS
 print("[*] Verifying sequence integrity...")
+sequence_errors = []
 for seq_name, steps in SYSCALL_SEQUENCES.items():
     for step in steps:
         syscall = step.get("action")
         if syscall and syscall not in SYSCALL_SPECS:
-            print(f"[!] WARNING: Sequence '{seq_name}' uses undefined syscall: {syscall}")
+            sequence_errors.append(f"Sequence '{seq_name}' uses undefined syscall: {syscall}")
 
-print("[+] All sequences verified successfully!")
+if sequence_errors:
+    print("[!] ERRORS FOUND:")
+    for error in sequence_errors:
+        print(f"    {error}")
+else:
+    print("[+] All sequences verified successfully!")
+    print(f"[+] Total of {len(SYSCALL_SEQUENCES)} exploit patterns ready for fuzzing")

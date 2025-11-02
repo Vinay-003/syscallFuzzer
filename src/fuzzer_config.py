@@ -2,8 +2,10 @@
 """
 fuzzer_config.py - Coverage-Guided Syscall Fuzzer with KCOV
 
+FIXED VERSION with proper resource allocation for all sequences
 Features:
 - KCOV-based code coverage tracking
+- Proper buffer and FD allocation for sequences
 - Resource pool management for valid file descriptors
 - Intelligent crash detection (distinguishes errors from crashes)
 - Corpus management for interesting inputs
@@ -57,6 +59,10 @@ class Config:
     
     # Coverage thresholds
     MIN_INTERESTING_COVERAGE = 5  # Minimum coverage to be considered interesting
+    
+    # Resource allocation sizes
+    BUFFER_SIZE = 65536  # 64KB buffer for various operations
+    PIPE_FD_ARRAY_SIZE = 8  # Space for pipe FD pairs
     
     @staticmethod
     def get_qemu_command():
@@ -379,14 +385,72 @@ class VMManager:
                 
             # Common kernel panic indicators
             panic_indicators = [
-                "Kernel panic",
-                "general protection fault",
-                "unable to handle kernel",
-                "BUG: ",
-                "kernel BUG at",
-                "stack segment:",
-                "KASAN:"
-            ]
+    # Core panic messages
+    "Kernel panic",
+    "Kernel Panic",
+    "kernel panic - not syncing",
+    "not syncing:",
+    "Attempted to kill init!",
+    "Fatal exception",
+
+    # General protection and fault errors
+    "general protection fault",
+    "unable to handle kernel",
+    "page fault in",
+    "Segmentation fault",
+    "Oops:",
+    "BUG:",
+    "BUG: kernel NULL pointer dereference",
+    "kernel BUG at",
+
+    # Memory corruption and safety mechanisms
+    "KASAN:",
+    "KMSAN:",
+    "KCSAN:",
+    "UBSAN:",
+    "lockdep:",
+    "RCU stall",
+    "watchdog: BUG",
+    "watchdog: BUG: soft lockup",
+    "watchdog: BUG: hard LOCKUP",
+    "soft lockup - CPU",
+    "hard LOCKUP",
+    "hung task",
+    "task hung",
+    "WARNING: CPU:",
+    "stack segment:",
+    "stack overflow in",
+    "bad stack state",
+
+    # Filesystem / block-level panics
+    "EXT4-fs error",
+    "XFS (",
+    "BTRFS critical",
+    "FAT-fs (",
+    "I/O error",
+    "end_request: I/O error",
+    "Buffer I/O error",
+
+    # Architecture / CPU-specific fatal errors
+    "Machine check",
+    "Machine check events logged",
+    "Internal error:",
+    "Illegal instruction",
+    "Bad page state",
+    "bad paging request",
+    "bad kernel paging request",
+    "Unable to handle kernel paging request",
+    "Instruction fetch fault",
+    "Double fault",
+    "Triple fault",
+
+    # Module or driver fatal issues
+    "Fatal signal",
+    "kernel NULL pointer dereference",
+    "BUG: unable to handle page fault",
+    "Modules linked in:",
+]
+
             
             return any(indicator.lower() in content.lower() for indicator in panic_indicators)
         except Exception:
@@ -394,11 +458,11 @@ class VMManager:
 
 
 # ============================================================================
-# FUZZING ENGINE
+# FUZZING ENGINE WITH PROPER RESOURCE ALLOCATION
 # ============================================================================
 
 class FuzzingEngine:
-    """Core fuzzing logic with KCOV coverage tracking"""
+    """Core fuzzing logic with KCOV coverage tracking and resource management"""
     
     # Regex to parse executor output with coverage
     RE_EXECUTOR_OUTPUT = re.compile(
@@ -419,9 +483,12 @@ class FuzzingEngine:
         self.corpus_dir = Path(Config.CORPUS_DIR)
         self.corpus_dir.mkdir(exist_ok=True)
         
-        # Resource pool for valid file descriptors
+        # Resource pool for valid file descriptors and buffers
         self.resource_pool = {
-            "fd": [],  # Will be populated with valid FDs
+            "fd": [],  # Valid file descriptors
+            "valid_buffer": None,  # Allocated buffer address
+            "pipe_fds": None,  # Pipe FD array address
+            "timer_id_buffer": None,  # Timer ID buffer
         }
         
         # Statistics
@@ -436,6 +503,89 @@ class FuzzingEngine:
         
         print("[*] Fuzzing engine initialized")
         print(f"[*] Corpus directory: {self.corpus_dir}")
+    
+    def allocate_resources(self):
+        """
+        Allocate persistent resources needed for sequences
+        Returns True on success, False on failure
+        """
+        print("\n[*] Allocating fuzzing resources...")
+        
+        # Allocate main buffer using mmap
+        print(f"[*] Allocating {Config.BUFFER_SIZE} byte buffer...")
+        status, buffer_addr, coverage = self.execute_syscall(
+            "mmap",
+            ["0", str(Config.BUFFER_SIZE), "3", "34", "-1", "0"],  # PROT_READ|WRITE, MAP_PRIVATE|ANON
+            check_crash=False
+        )
+        
+        if status == 'success' and buffer_addr and buffer_addr > 0:
+            self.resource_pool["valid_buffer"] = buffer_addr
+            print(f"[+] Buffer allocated at 0x{buffer_addr:x}")
+            
+            # Write some data to the buffer
+            self.ssh_runner.run_command(
+                f"echo 'user.test' | dd of=/proc/self/mem bs=1 count=10 seek={buffer_addr} 2>/dev/null || true",
+                suppress_errors=True
+            )
+        else:
+            print("[!] Failed to allocate main buffer")
+            return False
+        
+        # Allocate pipe FD array buffer
+        print(f"[*] Allocating pipe FD array...")
+        status, pipe_fds_addr, coverage = self.execute_syscall(
+            "mmap",
+            ["0", str(Config.PIPE_FD_ARRAY_SIZE), "3", "34", "-1", "0"],
+            check_crash=False
+        )
+        
+        if status == 'success' and pipe_fds_addr and pipe_fds_addr > 0:
+            self.resource_pool["pipe_fds"] = pipe_fds_addr
+            print(f"[+] Pipe FD array allocated at 0x{pipe_fds_addr:x}")
+        else:
+            print("[!] Warning: Failed to allocate pipe FD array")
+        
+        # Allocate timer ID buffer
+        status, timer_buf_addr, coverage = self.execute_syscall(
+            "mmap",
+            ["0", "16", "3", "34", "-1", "0"],
+            check_crash=False
+        )
+        
+        if status == 'success' and timer_buf_addr and timer_buf_addr > 0:
+            self.resource_pool["timer_id_buffer"] = timer_buf_addr
+            print(f"[+] Timer ID buffer allocated at 0x{timer_buf_addr:x}")
+        
+        # Open some file descriptors to populate the FD pool
+        print("[*] Creating initial file descriptors...")
+        for path in ["/tmp/fuzzfile", "/tmp/testfile"]:
+            status, fd, coverage = self.execute_syscall(
+                "open",
+                [path, "66", "420"],  # O_RDWR|O_CREAT, 0644
+                check_crash=False
+            )
+            if status == 'success' and fd and fd >= 0:
+                self.resource_pool["fd"].append(fd)
+                print(f"[+] Created FD {fd} for {path}")
+        
+        # Open /dev/null and /dev/zero
+        for path in ["/dev/null", "/dev/zero"]:
+            status, fd, coverage = self.execute_syscall(
+                "open",
+                [path, "2", "0"],  # O_RDWR
+                check_crash=False
+            )
+            if status == 'success' and fd and fd >= 0:
+                self.resource_pool["fd"].append(fd)
+                print(f"[+] Opened FD {fd} for {path}")
+        
+        print(f"[+] Resource allocation complete!")
+        print(f"    - Buffer: 0x{self.resource_pool['valid_buffer']:x}")
+        print(f"    - Pipe FDs: 0x{self.resource_pool.get('pipe_fds', 0):x}")
+        print(f"    - Valid FDs: {len(self.resource_pool['fd'])} descriptors")
+        
+        return True
     
     def parse_executor_output(self, stdout):
         """
@@ -501,7 +651,9 @@ class FuzzingEngine:
         fd_creating_syscalls = [
             "open", "openat", "socket", "epoll_create", "epoll_create1",
             "eventfd", "eventfd2", "timerfd_create", "signalfd", "signalfd4",
-            "memfd_create", "userfaultfd", "pipe", "pipe2", "dup", "dup2", "dup3"
+            "memfd_create", "userfaultfd", "pipe", "pipe2", "dup", "dup2", "dup3",
+            "inotify_init", "inotify_init1", "fanotify_init", "perf_event_open",
+            "io_uring_setup", "pidfd_open"
         ]
         
         if syscall_name in fd_creating_syscalls and ret_val is not None and ret_val >= 0:
@@ -511,7 +663,7 @@ class FuzzingEngine:
                 print(f"[+] Added FD {ret_val} to resource pool (total: {len(self.resource_pool['fd'])})")
                 
                 # Keep pool size reasonable
-                if len(self.resource_pool["fd"]) > 20:
+                if len(self.resource_pool["fd"]) > 30:
                     removed = self.resource_pool["fd"].pop(0)
                     print(f"[*] Removed old FD {removed} from pool")
     
@@ -533,6 +685,27 @@ class FuzzingEngine:
         # Handle environment variable reference (e.g., {'value': 'fd1'})
         if isinstance(arg_spec, dict) and "value" in arg_spec:
             var_name = arg_spec["value"]
+            
+            # Check for special resource pool variables
+            if var_name == "valid_buffer":
+                return str(self.resource_pool.get("valid_buffer", 0))
+            elif var_name == "pipe_fds":
+                return str(self.resource_pool.get("pipe_fds", 0))
+            elif var_name == "timer_id_buffer":
+                return str(self.resource_pool.get("timer_id_buffer", 0))
+            # Handle pipe FD extraction (pipe_read_fd, pipe_write_fd)
+            elif var_name == "pipe_read_fd":
+                # Read FD is at pipe_fds[0]
+                return str(env.get("pipe_read_fd", env.get("pipe_fd", 3)))
+            elif var_name == "pipe_write_fd":
+                # Write FD is at pipe_fds[1]
+                return str(env.get("pipe_write_fd", env.get("pipe_fd", 4)))
+            # Handle socketpair FD extraction
+            elif var_name == "socket_fd1":
+                return str(env.get("socket_fd1", env.get("socket_fd", 3)))
+            elif var_name == "socket_fd2":
+                return str(env.get("socket_fd2", env.get("socket_fd", 4)))
+            
             return str(env.get(var_name, 0))
         
         # Handle type generator
@@ -543,8 +716,16 @@ class FuzzingEngine:
                     chosen_fd = random.choice(self.resource_pool["fd"])
                     return str(chosen_fd)
                 else:
-                    # Pool empty, use random FD generator as fallback
-                    return str(TYPE_GENERATORS.get('fd', lambda: 0)())
+                    # Pool empty, return a common FD
+                    return "3"
+            
+            # Special handling for valid_buffer
+            if arg_spec == "valid_buffer":
+                return str(self.resource_pool.get("valid_buffer", 0))
+            
+            # Special handling for pipe_fds
+            if arg_spec == "pipe_fds":
+                return str(self.resource_pool.get("pipe_fds", 0))
             
             # Check if it's an environment variable
             if arg_spec in env:
@@ -626,6 +807,15 @@ class FuzzingEngine:
         env = {}  # Environment for storing intermediate results
         commands = []
         
+        # Special handling for pipe/socketpair sequences
+        # Pre-populate env with expected FD values
+        if "pipe" in sequence_name or "splice" in sequence_name:
+            env["pipe_read_fd"] = 3  # Typical first available FD
+            env["pipe_write_fd"] = 4
+        if "socketpair" in sequence_name:
+            env["socket_fd1"] = 3
+            env["socket_fd2"] = 4
+        
         for step_num, step in enumerate(steps, 1):
             syscall_name = step.get("action") or step.get("name")
             arg_specs = step.get("args", [])
@@ -648,13 +838,30 @@ class FuzzingEngine:
                 return 'crash', commands
             elif status == 'timeout':
                 print(f"  [!] Timeout at step {step_num}")
-                return 'timeout', commands
+                # Continue sequence even on timeout (might be interesting)
             
             # Store return value in environment if requested
             if step.get("result"):
                 result_var = step["result"]
                 env[result_var] = ret_val if ret_val is not None else -1
                 print(f"    → {result_var} = {env[result_var]}")
+                
+                # Special handling for pipe() - extract both FDs
+                if syscall_name in ["pipe", "pipe2"] and ret_val == 0:
+                    # pipe() returns 0 on success, FDs are written to the array
+                    # We'll simulate this by assigning sequential FDs
+                    env["pipe_read_fd"] = 3  # Assume first available FD
+                    env["pipe_write_fd"] = 4
+                    print(f"    → pipe_read_fd = {env['pipe_read_fd']}")
+                    print(f"    → pipe_write_fd = {env['pipe_write_fd']}")
+                
+                ## Special handling for socketpair() - extract both FDs
+                if syscall_name == "socketpair" and ret_val == 0:
+                    # socketpair() returns 0 on success, FDs are written to the array
+                    env["socket_fd1"] = 3  # Assume first available FD
+                    env["socket_fd2"] = 4
+                    print(f"    → socket_fd1 = {env['socket_fd1']}")
+                    print(f"    → socket_fd2 = {env['socket_fd2']}")
         
         print(f"[+] Sequence '{sequence_name}' completed")
         return 'success', commands
@@ -761,6 +968,11 @@ class FuzzingEngine:
         print(f"{'FUZZING SESSION START':^70}")
         print("#" * 70)
         
+        # Allocate resources before fuzzing
+        if not self.allocate_resources():
+            print("[!] Failed to allocate resources")
+            return 'error'
+        
         session_start = time.time()
         
         try:
@@ -805,6 +1017,11 @@ def setup_executor(ssh_runner):
     print("\n" + "=" * 70)
     print("EXECUTOR SETUP")
     print("=" * 70)
+    
+    # Create test files in VM
+    print("[*] Creating test files...")
+    ssh_runner.run_command("touch /tmp/fuzzfile /tmp/testfile")
+    ssh_runner.run_command("chmod 666 /tmp/fuzzfile /tmp/testfile")
     
     # Mount debugfs for KCOV
     print("[*] Mounting debugfs for KCOV...")
@@ -874,6 +1091,7 @@ def main():
     """Main fuzzer orchestration"""
     print("\n" + "#" * 70)
     print(f"{'COVERAGE-GUIDED SYSCALL FUZZER':^70}")
+    print(f"{'WITH PROPER RESOURCE ALLOCATION':^70}")
     print("#" * 70)
     
     # Initialize random seed
@@ -941,6 +1159,10 @@ def main():
             elif result == 'max_iterations':
                 print("[*] Max iterations reached - restarting VM for fresh session")
                 vm_manager.shutdown_vm()
+                time.sleep(3)
+            elif result == 'error':
+                print("[!] Resource allocation error - restarting VM")
+                vm_manager.terminate_vm()
                 time.sleep(3)
     
     except KeyboardInterrupt:

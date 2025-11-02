@@ -12,3 +12,5 @@ src/console.log
 /src/console.log
 readme previous,md
 .gitignore
+runningbutnotcrashing
+uncmpfuzzer_config.py
