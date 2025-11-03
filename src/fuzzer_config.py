@@ -2,14 +2,15 @@
 """
 fuzzer_config.py - Coverage-Guided Syscall Fuzzer with KCOV
 
-FIXED VERSION with proper resource allocation for all sequences
+FINAL VERSION with metric tracking for "Slide 7"
 Features:
 - KCOV-based code coverage tracking
+- PC-based coverage tracking (stubbed, requires executor.c modification)
 - Proper buffer and FD allocation for sequences
 - Resource pool management for valid file descriptors
 - Intelligent crash detection (distinguishes errors from crashes)
 - Corpus management for interesting inputs
-- Comprehensive logging and statistics
+- Comprehensive logging and statistics for 3-minute test runs
 """
 
 import subprocess
@@ -25,7 +26,15 @@ from pathlib import Path
 import shutil
 
 # Import fuzzing logic
-from fuzzer_brain import SYSCALL_SPECS, SYSCALL_SEQUENCES, TYPE_GENERATORS
+# We need this for the final stats calculation
+try:
+    from fuzzer_brain import SYSCALL_SPECS, SYSCALL_SEQUENCES, TYPE_GENERATORS
+except ImportError:
+    print("[!] Warning: fuzzer_brain.py not found.")
+    print("[!] Stats for 'Syscalls tested %' will not be available.")
+    SYSCALL_SPECS = {} # Dummy variable
+    SYSCALL_SEQUENCES = {}
+    TYPE_GENERATORS = {}
 
 # ============================================================================
 # CONFIGURATION
@@ -55,10 +64,21 @@ class Config:
     # Fuzzing behavior
     SEQUENCE_PROBABILITY = 0.3  # 30% chance to run sequence vs single syscall
     ITERATION_DELAY = 0.05  # seconds between iterations
-    MAX_ITERATIONS_PER_SESSION = 1000  # Restart VM after this many iterations
+    
+    # === NEW: METRIC TEST CONFIG ===
+    SESSION_DURATION_MINUTES = 3 # Duration for the "Slide 7" test run
+    STATS_UPDATE_INTERVAL = 5 # Seconds, for calculating peak throughput
+    
+    # === NEW: KCOV A/B TEST SWITCH ===
+    # Set this to False to compile/run *without* KCOV
+    # to measure overhead
+    ENABLE_KCOV = True
+    
+    # Set this to your mmap'd buffer size in executor.c
+    KCOV_BUFFER_SIZE_MB = 64 
     
     # Coverage thresholds
-    MIN_INTERESTING_COVERAGE = 5  # Minimum coverage to be considered interesting
+    MIN_INTERESTING_COVERAGE_PCS = 1 # Min *new* PCs to be interesting
     
     # Resource allocation sizes
     BUFFER_SIZE = 65536  # 64KB buffer for various operations
@@ -385,72 +405,25 @@ class VMManager:
                 
             # Common kernel panic indicators
             panic_indicators = [
-    # Core panic messages
-    "Kernel panic",
-    "Kernel Panic",
-    "kernel panic - not syncing",
-    "not syncing:",
-    "Attempted to kill init!",
-    "Fatal exception",
-
-    # General protection and fault errors
-    "general protection fault",
-    "unable to handle kernel",
-    "page fault in",
-    "Segmentation fault",
-    "Oops:",
-    "BUG:",
-    "BUG: kernel NULL pointer dereference",
-    "kernel BUG at",
-
-    # Memory corruption and safety mechanisms
-    "KASAN:",
-    "KMSAN:",
-    "KCSAN:",
-    "UBSAN:",
-    "lockdep:",
-    "RCU stall",
-    "watchdog: BUG",
-    "watchdog: BUG: soft lockup",
-    "watchdog: BUG: hard LOCKUP",
-    "soft lockup - CPU",
-    "hard LOCKUP",
-    "hung task",
-    "task hung",
-    "WARNING: CPU:",
-    "stack segment:",
-    "stack overflow in",
-    "bad stack state",
-
-    # Filesystem / block-level panics
-    "EXT4-fs error",
-    "XFS (",
-    "BTRFS critical",
-    "FAT-fs (",
-    "I/O error",
-    "end_request: I/O error",
-    "Buffer I/O error",
-
-    # Architecture / CPU-specific fatal errors
-    "Machine check",
-    "Machine check events logged",
-    "Internal error:",
-    "Illegal instruction",
-    "Bad page state",
-    "bad paging request",
-    "bad kernel paging request",
-    "Unable to handle kernel paging request",
-    "Instruction fetch fault",
-    "Double fault",
-    "Triple fault",
-
-    # Module or driver fatal issues
-    "Fatal signal",
-    "kernel NULL pointer dereference",
-    "BUG: unable to handle page fault",
-    "Modules linked in:",
-]
-
+                "Kernel panic", "Kernel Panic", "kernel panic - not syncing",
+                "not syncing:", "Attempted to kill init!", "Fatal exception",
+                "general protection fault", "unable to handle kernel",
+                "page fault in", "Segmentation fault", "Oops:", "BUG:",
+                "BUG: kernel NULL pointer dereference", "kernel BUG at",
+                "KASAN:", "KMSAN:", "KCSAN:", "UBSAN:", "lockdep:",
+                "RCU stall", "watchdog: BUG", "watchdog: BUG: soft lockup",
+                "watchdog: BUG: hard LOCKUP", "soft lockup - CPU", "hard LOCKUP",
+                "hung task", "task hung", "WARNING: CPU:", "stack segment:",
+                "stack overflow in", "bad stack state", "EXT4-fs error", "XFS (",
+                "BTRFS critical", "FAT-fs (", "I/O error", "end_request: I/O error",
+                "Buffer I/O error", "Machine check", "Machine check events logged",
+                "Internal error:", "Illegal instruction", "Bad page state",
+                "bad paging request", "bad kernel paging request",
+                "Unable to handle kernel paging request", "Instruction fetch fault",
+                "Double fault", "Triple fault", "Fatal signal",
+                "kernel NULL pointer dereference", "BUG: unable to handle page fault",
+                "Modules linked in:",
+            ]
             
             return any(indicator.lower() in content.lower() for indicator in panic_indicators)
         except Exception:
@@ -464,10 +437,13 @@ class VMManager:
 class FuzzingEngine:
     """Core fuzzing logic with KCOV coverage tracking and resource management"""
     
-    # Regex to parse executor output with coverage
+    # Regex to parse executor output with coverage AND pc_data
     RE_EXECUTOR_OUTPUT = re.compile(
-        r"syscall\((\d+)\)\s*=\s*(-?\d+)(?:.*?coverage=(\d+))?"
+        r"syscall\((\d+)\)\s*=\s*(-?\d+)"
+        r"(?:.*?coverage=(\d+))?"  # Optional coverage count
+        r"(?:.*?pc_data=([a-fA-F0-9x,]+))?" # <-- NEW: Capture PC data
     )
+
     
     def __init__(self, ssh_runner, crash_logger, vm_manager):
         self.ssh_runner = ssh_runner
@@ -475,9 +451,10 @@ class FuzzingEngine:
         self.vm_manager = vm_manager
         self.iteration = 0
         
-        # Coverage tracking - store sets of unique PCs (program counters)
-        self.coverage_map = {}  # Maps coverage count to set of inputs
-        self.total_coverage = set()  # All unique coverage counts seen
+        # --- NEW: PC-based Coverage Tracking ---
+        # This set will store all unique PC addresses (e.g., '0xffffffff810000a0')
+        self.total_coverage_pcs = set()
+        self.syscalls_hit = set() # For 'Syscalls tested %' metric
         
         # Corpus management
         self.corpus_dir = Path(Config.CORPUS_DIR)
@@ -491,15 +468,26 @@ class FuzzingEngine:
             "timer_id_buffer": None,  # Timer ID buffer
         }
         
-        # Statistics
+        # --- NEW: Statistics for Slide 7 ---
         self.stats = {
             "total_syscalls": 0,
             "total_sequences": 0,
             "errors": 0,  # Expected errors (ENOENT, EINVAL, etc.)
             "crashes": 0,  # Actual crashes/panics
-            "new_coverage": 0,
-            "iterations": 0
+            "new_coverage_inputs": 0, # Inputs that added new coverage
+            "iterations": 0,
+            "peak_throughput": 0.0,
+            "initial_coverage_pcs": 0,
+            "final_coverage_pcs": 0,
+            "first_crash_time": -1.0, # Relative to session start
+            "first_crash_iter": -1,
+            "session_start_time": 0.0,
+            "session_end_time": 0.0,
         }
+        
+        # For peak throughput calculation
+        self.last_stat_check_time = time.time()
+        self.last_stat_check_syscalls = 0
         
         print("[*] Fuzzing engine initialized")
         print(f"[*] Corpus directory: {self.corpus_dir}")
@@ -513,11 +501,13 @@ class FuzzingEngine:
         
         # Allocate main buffer using mmap
         print(f"[*] Allocating {Config.BUFFER_SIZE} byte buffer...")
-        status, buffer_addr, coverage = self.execute_syscall(
+        status, buffer_addr, new_pcs = self.execute_syscall(
             "mmap",
             ["0", str(Config.BUFFER_SIZE), "3", "34", "-1", "0"],  # PROT_READ|WRITE, MAP_PRIVATE|ANON
             check_crash=False
         )
+        if new_pcs: # Track coverage from setup
+             self.total_coverage_pcs.update(new_pcs)
         
         if status == 'success' and buffer_addr and buffer_addr > 0:
             self.resource_pool["valid_buffer"] = buffer_addr
@@ -534,11 +524,12 @@ class FuzzingEngine:
         
         # Allocate pipe FD array buffer
         print(f"[*] Allocating pipe FD array...")
-        status, pipe_fds_addr, coverage = self.execute_syscall(
+        status, pipe_fds_addr, new_pcs = self.execute_syscall(
             "mmap",
             ["0", str(Config.PIPE_FD_ARRAY_SIZE), "3", "34", "-1", "0"],
             check_crash=False
         )
+        if new_pcs: self.total_coverage_pcs.update(new_pcs)
         
         if status == 'success' and pipe_fds_addr and pipe_fds_addr > 0:
             self.resource_pool["pipe_fds"] = pipe_fds_addr
@@ -547,12 +538,13 @@ class FuzzingEngine:
             print("[!] Warning: Failed to allocate pipe FD array")
         
         # Allocate timer ID buffer
-        status, timer_buf_addr, coverage = self.execute_syscall(
+        status, timer_buf_addr, new_pcs = self.execute_syscall(
             "mmap",
             ["0", "16", "3", "34", "-1", "0"],
             check_crash=False
         )
-        
+        if new_pcs: self.total_coverage_pcs.update(new_pcs)
+
         if status == 'success' and timer_buf_addr and timer_buf_addr > 0:
             self.resource_pool["timer_id_buffer"] = timer_buf_addr
             print(f"[+] Timer ID buffer allocated at 0x{timer_buf_addr:x}")
@@ -560,22 +552,24 @@ class FuzzingEngine:
         # Open some file descriptors to populate the FD pool
         print("[*] Creating initial file descriptors...")
         for path in ["/tmp/fuzzfile", "/tmp/testfile"]:
-            status, fd, coverage = self.execute_syscall(
+            status, fd, new_pcs = self.execute_syscall(
                 "open",
                 [path, "66", "420"],  # O_RDWR|O_CREAT, 0644
                 check_crash=False
             )
+            if new_pcs: self.total_coverage_pcs.update(new_pcs)
             if status == 'success' and fd and fd >= 0:
                 self.resource_pool["fd"].append(fd)
                 print(f"[+] Created FD {fd} for {path}")
         
         # Open /dev/null and /dev/zero
         for path in ["/dev/null", "/dev/zero"]:
-            status, fd, coverage = self.execute_syscall(
+            status, fd, new_pcs = self.execute_syscall(
                 "open",
                 [path, "2", "0"],  # O_RDWR
                 check_crash=False
             )
+            if new_pcs: self.total_coverage_pcs.update(new_pcs)
             if status == 'success' and fd and fd >= 0:
                 self.resource_pool["fd"].append(fd)
                 print(f"[+] Opened FD {fd} for {path}")
@@ -587,48 +581,69 @@ class FuzzingEngine:
         
         return True
     
+    def log_initial_coverage(self):
+        """
+        Called once after allocate_resources() to set the
+        baseline coverage for the 30-min run.
+        """
+        initial_pcs = len(self.total_coverage_pcs)
+        self.stats["initial_coverage_pcs"] = initial_pcs
+        print(f"[+] Initial coverage after setup: {initial_pcs} PCs")
+    
     def parse_executor_output(self, stdout):
         """
         Extract syscall return value and coverage from executor output
         
         Returns:
-            (return_value: int or None, coverage_count: int or None)
+            (return_value: int, coverage_count: int, new_pcs: set)
         """
         if not stdout:
-            return None, None
+            return None, 0, set()
         
         match = self.RE_EXECUTOR_OUTPUT.search(stdout)
         if match:
             try:
                 ret_val = int(match.group(2))
-                coverage = int(match.group(3)) if match.group(3) else None
-                return ret_val, coverage
+                coverage_count = int(match.group(3)) if match.group(3) else 0
+                
+                # --- THIS IS THE NEW PARSING LOGIC ---
+                new_pcs = set()
+                pc_data_str = match.group(4) # Get the captured pc_data string
+                
+                if pc_data_str:
+                    # Split the comma-separated string and add to the set
+                    new_pcs = set(pc.strip() for pc in pc_data_str.split(',') if pc.strip())
+                # --- END OF NEW LOGIC ---
+                    
+                return ret_val, coverage_count, new_pcs
             except (ValueError, IndexError):
-                return None, None
-        return None, None
+                return None, 0, set()
+        return None, 0, set()
     
-    def is_interesting_coverage(self, coverage_count):
+    def is_interesting_input(self, new_pcs_from_input):
         """
-        Determine if coverage count represents new/interesting code paths
+        Determine if an input provided new, unseen PCs
         
         Args:
-            coverage_count: Number of unique PCs covered
+            new_pcs_from_input: A set of PCs from the last execution
             
         Returns:
-            True if this is new or interesting coverage
+            (is_interesting: bool, newly_discovered_pcs: set)
         """
-        if coverage_count is None or coverage_count < Config.MIN_INTERESTING_COVERAGE:
-            return False
+        if not new_pcs_from_input:
+            return False, set()
         
-        # New coverage count we haven't seen before
-        if coverage_count not in self.total_coverage:
-            return True
+        # Check for PCs that are not in our global set
+        newly_discovered_pcs = new_pcs_from_input - self.total_coverage_pcs
         
-        return False
+        if len(newly_discovered_pcs) >= Config.MIN_INTERESTING_COVERAGE_PCS:
+            return True, newly_discovered_pcs
+        
+        return False, set()
     
-    def save_to_corpus(self, command, coverage_count):
+    def save_to_corpus(self, command, new_pc_count):
         """Save interesting input to corpus"""
-        filename = self.corpus_dir / f"cov_{coverage_count}_iter_{self.iteration}"
+        filename = self.corpus_dir / f"cov_{new_pc_count}_iter_{self.iteration}"
         
         try:
             with open(filename, "w") as f:
@@ -762,8 +777,7 @@ class FuzzingEngine:
             check_crash: Whether to check for crashes
         
         Returns:
-            (status: str, return_value: int or None, coverage: int or None)
-            status can be: 'success', 'error', 'timeout', 'crash'
+            (status: str, return_value: int, new_pcs: set)
         """
         command = f"{Config.EXECUTOR_VM_PATH} {syscall_name} {' '.join(args)}"
         result = self.ssh_runner.run_command(command, suppress_errors=True)
@@ -771,11 +785,11 @@ class FuzzingEngine:
         # Check for timeout (potential hang/crash)
         if result is None:
             if check_crash and self.vm_manager.check_for_kernel_panic():
-                return 'crash', None, None
-            return 'timeout', None, None
+                return 'crash', None, set()
+            return 'timeout', None, set()
         
-        # Parse output
-        ret_val, coverage = self.parse_executor_output(result.stdout)
+        # Parse output - this now returns all 3 values
+        ret_val, coverage_count, new_pcs = self.parse_executor_output(result.stdout)
         
         # Update resource pool if syscall succeeded
         if ret_val is not None and ret_val >= 0:
@@ -783,29 +797,28 @@ class FuzzingEngine:
         
         # Determine status
         if result.returncode != 0:
-            # Non-zero exit could be normal (syscall returned error)
-            # or could indicate executor crash
             if "Error:" in result.stderr or result.returncode == 124:
-                return 'timeout', ret_val, coverage
+                return 'timeout', ret_val, new_pcs
             elif check_crash and self.vm_manager.check_for_kernel_panic():
-                return 'crash', ret_val, coverage
+                return 'crash', ret_val, new_pcs
             else:
-                # Likely just a syscall that returned an error
-                return 'error', ret_val, coverage
+                return 'error', ret_val, new_pcs
         
-        return 'success', ret_val, coverage
-    
+        # Return all three values
+        return 'success', ret_val, new_pcs
+
     def execute_sequence(self, sequence_name, steps):
         """
         Execute a sequence of syscalls with environment tracking
         
         Returns:
-            (status: str, commands_executed: list)
+            (status: str, commands_executed: list, all_new_pcs: set)
         """
         print(f"\n[*] Executing sequence: {sequence_name}")
         
         env = {}  # Environment for storing intermediate results
         commands = []
+        all_new_pcs = set() # Aggregate PCs from all steps
         
         # Special handling for pipe/socketpair sequences
         # Pre-populate env with expected FD values
@@ -830,12 +843,13 @@ class FuzzingEngine:
             print(f"  [{step_num}/{len(steps)}] {syscall_name}({', '.join(args)})")
             
             # Execute syscall
-            status, ret_val, coverage = self.execute_syscall(syscall_name, args, check_crash=True)
+            status, ret_val, new_pcs = self.execute_syscall(syscall_name, args, check_crash=True)
+            all_new_pcs.update(new_pcs) # Aggregate PCs
             
             # Handle result
             if status == 'crash':
                 print(f"  [!] Crash detected at step {step_num}")
-                return 'crash', commands
+                return 'crash', commands, all_new_pcs
             elif status == 'timeout':
                 print(f"  [!] Timeout at step {step_num}")
                 # Continue sequence even on timeout (might be interesting)
@@ -864,8 +878,11 @@ class FuzzingEngine:
                     print(f"    → socket_fd2 = {env['socket_fd2']}")
         
         print(f"[+] Sequence '{sequence_name}' completed")
-        return 'success', commands
+        return 'success', commands, all_new_pcs
     
+    #
+    # --- THIS IS THE CORRECTED FUNCTION ---
+    #
     def run_iteration(self):
         """
         Run a single fuzzing iteration
@@ -889,14 +906,26 @@ class FuzzingEngine:
         if run_sequence:
             # Execute sequence
             sequence_name, steps = random.choice(list(SYSCALL_SEQUENCES.items()))
-            status, commands = self.execute_sequence(sequence_name, steps)
+            status, commands, all_new_pcs = self.execute_sequence(sequence_name, steps)
             
             self.stats["total_sequences"] += 1
             self.stats["total_syscalls"] += len(steps)
             
+            # Log syscalls tested
+            for step in steps:
+                self.syscalls_hit.add(step.get("action") or step.get("name"))
+
+            # --- CORRECTED LOGIC ---
+            # 1. Check for interesting coverage FIRST
+            is_new, new_pcs_found = self.is_interesting_input(all_new_pcs)
+                
             if status == 'crash':
                 # Real crash detected
                 self.stats["crashes"] += 1
+                if self.stats["first_crash_time"] == -1:
+                    self.stats["first_crash_time"] = time.time() - self.stats["session_start_time"]
+                    self.stats["first_crash_iter"] = self.iteration
+                
                 crash_dir = self.crash_logger.log_crash(
                     commands,
                     crash_context={
@@ -910,21 +939,38 @@ class FuzzingEngine:
                 return False  # Stop this session
             elif status in ('timeout', 'error'):
                 self.stats["errors"] += 1
+            
+            # 2. If it's new, NOW update global set and save to corpus
+            if is_new:
+                print(f"\n{'*' * 25} NEW COVERAGE! (Sequence) {'*' * 25}")
+                self.total_coverage_pcs.update(new_pcs_found) # Update global set
+                self.stats["new_coverage_inputs"] += 1
+                self.save_to_corpus("\n".join(commands), len(new_pcs_found))
+            # --- END CORRECTION ---
         
         else:
             # Execute single syscall
             syscall_name, args = self.generate_random_syscall()
+            self.syscalls_hit.add(syscall_name) # Log syscall tested
             command = f"{Config.EXECUTOR_VM_PATH} {syscall_name} {' '.join(args)}"
             
             print(f"[*] Testing: {syscall_name}({', '.join(args)})")
             
-            status, ret_val, coverage = self.execute_syscall(syscall_name, args, check_crash=True)
+            status, ret_val, new_pcs = self.execute_syscall(syscall_name, args, check_crash=True)
             
             self.stats["total_syscalls"] += 1
+
+            # --- CORRECTED LOGIC ---
+            # 1. Check for interesting coverage FIRST
+            is_new, new_pcs_found = self.is_interesting_input(new_pcs)
             
             # Handle crash
             if status == 'crash':
                 self.stats["crashes"] += 1
+                if self.stats["first_crash_time"] == -1:
+                    self.stats["first_crash_time"] = time.time() - self.stats["session_start_time"]
+                    self.stats["first_crash_iter"] = self.iteration
+
                 crash_dir = self.crash_logger.log_crash(
                     command,
                     crash_context={
@@ -932,7 +978,6 @@ class FuzzingEngine:
                         "syscall": syscall_name,
                         "args": args,
                         "iteration": self.iteration,
-                        "coverage": coverage,
                         "stats": self.stats.copy()
                     },
                     console_log_path=self.vm_manager.console_log_path
@@ -944,28 +989,41 @@ class FuzzingEngine:
                 self.stats["errors"] += 1
                 print(f"[*] Syscall returned error (expected)")
             
-            # Handle success with coverage
-            elif status == 'success' and coverage is not None:
-                print(f"[+] Return: {ret_val} | Coverage: {coverage} PCs")
-                
-                # Check if coverage is interesting
-                if self.is_interesting_coverage(coverage):
-                    print(f"\n{'*' * 25} NEW COVERAGE! {'*' * 25}")
-                    self.total_coverage.add(coverage)
-                    self.stats["new_coverage"] += 1
-                    self.save_to_corpus(command, coverage)
+            # 2. If it's new, NOW update global set and save to corpus
+            if is_new:
+                print(f"\n{'*' * 25} NEW COVERAGE! (Single) {'*' * 25}")
+                self.total_coverage_pcs.update(new_pcs_found) # Update global set
+                self.stats["new_coverage_inputs"] += 1
+                self.save_to_corpus(command, len(new_pcs_found))
+            # --- END CORRECTION ---
+        
+        # --- NEW: Calculate peak throughput ---
+        current_time = time.time()
+        time_delta = current_time - self.last_stat_check_time
+        
+        if time_delta > Config.STATS_UPDATE_INTERVAL:
+            syscall_delta = self.stats["total_syscalls"] - self.last_stat_check_syscalls
+            
+            if time_delta > 0:
+                current_throughput = syscall_delta / time_delta
+                if current_throughput > self.stats["peak_throughput"]:
+                    self.stats["peak_throughput"] = current_throughput
+            
+            self.last_stat_check_time = current_time
+            self.last_stat_check_syscalls = self.stats["total_syscalls"]
         
         return True  # Continue fuzzing
     
     def run_session(self):
         """
-        Run a complete fuzzing session until crash, max iterations, or interruption
+        Run a complete fuzzing session for the configured duration
         
         Returns:
-            str: 'interrupted', 'crash', or 'max_iterations'
+            str: 'interrupted', 'crash', or 'time_limit'
         """
         print("\n" + "#" * 70)
         print(f"{'FUZZING SESSION START':^70}")
+        print(f"Duration: {Config.SESSION_DURATION_MINUTES} minutes")
         print("#" * 70)
         
         # Allocate resources before fuzzing
@@ -973,38 +1031,126 @@ class FuzzingEngine:
             print("[!] Failed to allocate resources")
             return 'error'
         
-        session_start = time.time()
+        # Set initial coverage *after* allocation
+        self.log_initial_coverage()
+        
+        self.stats["session_start_time"] = time.time()
+        test_duration_sec = Config.SESSION_DURATION_MINUTES * 60
         
         try:
-            while self.iteration < Config.MAX_ITERATIONS_PER_SESSION:
+            # Main loop is now time-based
+            while (time.time() - self.stats["session_start_time"]) < test_duration_sec:
                 should_continue = self.run_iteration()
                 
                 if not should_continue:
                     # Crash detected
+                    self.stats["session_end_time"] = time.time()
                     return 'crash'
                 
                 time.sleep(Config.ITERATION_DELAY)
             
-            # Reached max iterations
-            return 'max_iterations'
+            # Reached time limit
+            self.stats["session_end_time"] = time.time()
+            print(f"\n[+] Session time limit ({Config.SESSION_DURATION_MINUTES} min) reached.")
+            return 'time_limit'
                 
         except KeyboardInterrupt:
             print("\n[!] Session interrupted by user")
+            self.stats["session_end_time"] = time.time()
             return 'interrupted'
+        
+    def _get_dir_size_mb(self, path):
+        """Helper to get directory size for stats"""
+        try:
+            total_size = 0
+            for dirpath, dirnames, filenames in os.walk(path):
+                for f in filenames:
+                    fp = os.path.join(dirpath, f)
+                    if not os.path.islink(fp):
+                        total_size += os.path.getsize(fp)
+            return total_size / (1024 * 1024) # Return size in MB
+        except Exception:
+            return 0.0
     
     def print_stats(self):
-        """Print comprehensive fuzzing statistics"""
+        """Print comprehensive fuzzing statistics (for Slide 7)"""
         print("\n" + "=" * 70)
-        print("FUZZING STATISTICS")
+        print(f"FINAL RESULTS – {Config.SESSION_DURATION_MINUTES} MINUTE RUN")
         print("=" * 70)
-        print(f"Total Iterations:      {self.stats['iterations']}")
-        print(f"Total Syscalls:        {self.stats['total_syscalls']}")
-        print(f"Total Sequences:       {self.stats['total_sequences']}")
-        print(f"Expected Errors:       {self.stats['errors']}")
-        print(f"Crashes Found:         {self.stats['crashes']}")
-        print(f"New Coverage Found:    {self.stats['new_coverage']}")
-        print(f"Total Unique Coverage: {len(self.total_coverage)}")
-        print(f"Resource Pool (FDs):   {len(self.resource_pool['fd'])}")
+        
+        start_time = self.stats["session_start_time"]
+        end_time = self.stats["session_end_time"]
+        
+        if start_time == 0.0 or end_time <= start_time:
+            print("[!] No session data recorded, cannot print stats.")
+            return
+            
+        run_duration_sec = end_time - start_time
+        run_duration_min = run_duration_sec / 60.0
+        
+        # --- Performance Metrics ---
+        print("\n--- Performance Metrics ---")
+        total_syscalls = self.stats["total_syscalls"]
+        if total_syscalls > 0:
+            ms_per_syscall = (run_duration_sec * 1000.0) / total_syscalls
+            sustained_throughput = total_syscalls / run_duration_sec
+            
+            print(f"Total syscalls:       {total_syscalls}")
+            print(f"Sustained Throughput: {sustained_throughput:.2f} syscalls/sec")
+            print(f"Peak Throughput:      {self.stats['peak_throughput']:.2f} syscalls/sec")
+            print(f"Execution Time:       {ms_per_syscall:.2f} ms per syscall")
+        else:
+            print("Total syscalls:       0")
+
+        print(f"KCOV Overhead:        [Run A/B test with ENABLE_KCOV=False]")
+        
+        # --- Resource Usage ---
+        print("\n--- Resource Usage ---")
+        corpus_size_mb = self._get_dir_size_mb(self.corpus_dir)
+        crash_size_mb = self._get_dir_size_mb(self.crash_logger.crashes_dir)
+        corpus_inputs = len(list(self.corpus_dir.glob('*')))
+        
+        print(f"CPU (Host):           [Measure externally with 'top' on qemu proc]")
+        print(f"CPU (Guest):          [Measure externally with 'ssh' + 'top']")
+        print(f"Memory (Host):        [Measure externally with 'top' on qemu proc]")
+        print(f"Memory (Guest):       [Measure externally with 'ssh' + 'top']")
+        print(f"KCOV Buffer:          {Config.KCOV_BUFFER_SIZE_MB} MB (from Config)")
+        print(f"Storage (Corpus):     {corpus_size_mb:.2f} MB ({corpus_inputs} inputs)")
+        print(f"Storage (Crashes):    {crash_size_mb:.2f} MB")
+        
+        # --- Coverage Statistics ---
+        print("\n--- Coverage Statistics ---")
+        initial_pcs = self.stats["initial_coverage_pcs"]
+        final_pcs = len(self.total_coverage_pcs)
+        self.stats["final_coverage_pcs"] = final_pcs # Save for later
+        
+        total_new_pcs = final_pcs - initial_pcs
+        growth_rate_pcs_per_hour = 0
+        if run_duration_min > 0:
+            growth_rate_pcs_per_hour = (total_new_pcs) / (run_duration_min / 60.0)
+        
+        print(f"Initial PCs:          {initial_pcs}")
+        print(f"Final PCs:            {final_pcs} (Total new: {total_new_pcs})")
+        print(f"Growth Rate:          {growth_rate_pcs_per_hour:.2f} PCs/hour")
+
+        if SYSCALL_SPECS:
+            total_possible_syscalls = len(SYSCALL_SPECS)
+            hit_syscalls = len(self.syscalls_hit)
+            hit_percent = (hit_syscalls / total_possible_syscalls) * 100.0
+            print(f"Syscalls tested:      {hit_syscalls} of {total_possible_syscalls} ({hit_percent:.1f}%)")
+        else:
+            print(f"Syscalls tested:      {len(self.syscalls_hit)} (fuzzer_brain not found)")
+
+        if self.stats["first_crash_time"] != -1:
+            crash_time_min = self.stats["first_crash_time"] / 60.0
+            print(f"First crash:          {crash_time_min:.2f} minutes (iteration {self.stats['first_crash_iter']})")
+        else:
+            print(f"First crash:          None found")
+            
+        # --- Reproducibility ---
+        print("\n--- Reproducibility ---")
+        print("Reproducibility:    [Run external crash reproduction script 20x]")
+        print("Consistent Coverage:  [Run this 30-min test 5x and compare Final PCs]")
         print("=" * 70)
 
 
@@ -1023,25 +1169,30 @@ def setup_executor(ssh_runner):
     ssh_runner.run_command("touch /tmp/fuzzfile /tmp/testfile")
     ssh_runner.run_command("chmod 666 /tmp/fuzzfile /tmp/testfile")
     
-    # Mount debugfs for KCOV
-    print("[*] Mounting debugfs for KCOV...")
-    result = ssh_runner.run_command(
-        "mountpoint -q /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug"
-    )
-    if not result or result.returncode != 0:
-        print("[!] Warning: Could not mount debugfs (KCOV may not work)")
-    
-    # Verify KCOV is available
-    print("[*] Verifying KCOV availability...")
-    result = ssh_runner.run_command(
-        "test -e /sys/kernel/debug/kcov && echo 'KCOV_OK'",
-        suppress_errors=True
-    )
-    if not result or "KCOV_OK" not in result.stdout:
-        print("[!] Warning: KCOV not available - coverage tracking will not work")
-        print("[!] Make sure you compiled the kernel with KCOV support")
+    # --- NEW: Conditional KCOV Setup ---
+    if Config.ENABLE_KCOV:
+        # Mount debugfs for KCOV
+        print("[*] Mounting debugfs for KCOV...")
+        result = ssh_runner.run_command(
+            "mountpoint -q /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug"
+        )
+        if not result or result.returncode != 0:
+            print("[!] Warning: Could not mount debugfs (KCOV may not work)")
+        
+        # Verify KCOV is available
+        print("[*] Verifying KCOV availability...")
+        result = ssh_runner.run_command(
+            "test -e /sys/kernel/debug/kcov && echo 'KCOV_OK'",
+            suppress_errors=True
+        )
+        if not result or "KCOV_OK" not in result.stdout:
+            print("[!] CRITICAL: KCOV not available - coverage tracking will not work")
+            print("[!] Make sure you compiled the kernel with KCOV support")
+            return False
+        else:
+            print("[+] KCOV is available")
     else:
-        print("[+] KCOV is available")
+        print("[*] KCOV is DISABLED (for A/B overhead testing)")
     
     # Transfer source
     if not ssh_runner.transfer_file(Config.EXECUTOR_SOURCE, "/root/executor.c"):
@@ -1060,10 +1211,21 @@ def setup_executor(ssh_runner):
     
     # Compile executor
     print("[*] Compiling executor...")
-    result = ssh_runner.run_command(
-        f"gcc -O2 -Wall /root/executor.c -o {Config.EXECUTOR_VM_PATH}",
-        timeout=60
-    )
+    
+    # --- NEW: Conditional Compilation ---
+    compile_cmd = f"gcc -O2 -Wall /root/executor.c -o {Config.EXECUTOR_VM_PATH}"
+    if Config.ENABLE_KCOV:
+        print("[+] Compiling with KCOV logic enabled (default).")
+        # If your C code needs a flag:
+        # compile_cmd += " -DENABLE_KCOV" 
+    else:
+        print("[!] Compiling with KCOV logic DISABLED.")
+        # You MUST use this flag in your executor.c to #ifdef out
+        # all KCOV-related calls (ioctl, mmap, etc.)
+        compile_cmd += " -DDISABLE_KCOV" 
+    
+    result = ssh_runner.run_command(compile_cmd, timeout=60)
+    
     if not result or result.returncode != 0:
         print("[!] Compilation failed")
         if result:
@@ -1156,8 +1318,8 @@ def main():
                 print("[*] Crash detected - restarting VM for next session")
                 vm_manager.terminate_vm()
                 time.sleep(3)
-            elif result == 'max_iterations':
-                print("[*] Max iterations reached - restarting VM for fresh session")
+            elif result == 'time_limit':
+                print("[*] Session complete - restarting VM for fresh session")
                 vm_manager.shutdown_vm()
                 time.sleep(3)
             elif result == 'error':
@@ -1174,6 +1336,7 @@ def main():
     finally:
         print("\n[*] Cleaning up...")
         vm_manager.terminate_vm()
+        # Ensure stats are printed at the very end
         fuzzing_engine.print_stats()
         print("[+] Fuzzer shutdown complete")
         print(f"\n[*] Total sessions run: {session_count}")
@@ -1185,3 +1348,4 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+

@@ -1,13 +1,13 @@
-/*
+/**
  * executor.c - Coverage-Guided Syscall Fuzzer Executor
- * 
- * Features:
- * - KCOV-based code coverage collection
+ * * Features:
+ * - KCOV-based code coverage collection (with PC list output)
  * - Comprehensive syscall coverage (200+ syscalls)
  * - Robust argument parsing with hex/decimal/octal support
  * - Safety limits to prevent system exhaustion
  * - Clean output format for fuzzer parsing
  * - Proper error handling and reporting
+ * - Conditional compilation (DISABLE_KCOV) for overhead testing
  */
 
 #include <stdio.h>
@@ -54,11 +54,16 @@ static int kcov_available = 0;
 
 /**
  * Initialize KCOV for code coverage collection
- * 
- * KCOV provides kernel code coverage by tracking which code paths
+ * * KCOV provides kernel code coverage by tracking which code paths
  * are executed during syscalls. This is essential for coverage-guided fuzzing.
  */
 static void init_kcov(void) {
+// --- CHANGE 1: Added conditional compilation block ---
+#ifdef DISABLE_KCOV
+    fprintf(stderr, "KCOV is disabled at compile time.\n");
+    return;
+#endif
+
     // Attempt to open KCOV device
     kcov_fd = open("/sys/kernel/debug/kcov", O_RDWR);
     if (kcov_fd == -1) {
@@ -94,13 +99,19 @@ static void init_kcov(void) {
     }
     
     kcov_available = 1;
-    printf("KCOV initialized successfully (buffer size: %d entries).\n", KCOV_COVER_SIZE);
+    // Don't print this on every run, it clutters the output
+    // printf("KCOV initialized successfully (buffer size: %d entries).\n", KCOV_COVER_SIZE);
 }
 
 /**
  * Enable KCOV coverage collection for the current thread
  */
 static inline void kcov_enable(void) {
+// --- CHANGE 1: Added conditional compilation block ---
+#ifdef DISABLE_KCOV
+    return; // Do nothing
+#endif
+
     if (kcov_fd != -1 && kcov_cover != NULL) {
         // Reset counter before enabling
         __atomic_store_n(&kcov_cover[0], 0, __ATOMIC_RELAXED);
@@ -110,10 +121,14 @@ static inline void kcov_enable(void) {
 
 /**
  * Disable KCOV coverage collection and return count
- * 
- * Returns: Number of unique program counters (PCs) covered
+ * * Returns: Number of unique program counters (PCs) covered
  */
 static inline unsigned long kcov_disable(void) {
+// --- CHANGE 1: Added conditional compilation block ---
+#ifdef DISABLE_KCOV
+    return 0;
+#endif
+
     unsigned long coverage_count = 0;
     
     if (kcov_fd != -1 && kcov_cover != NULL) {
@@ -123,6 +138,37 @@ static inline unsigned long kcov_disable(void) {
     }
     
     return coverage_count;
+}
+
+// --- CHANGE 2: Added new function to print PC list ---
+/**
+ * Print the collected KCOV PC addresses
+ * in a format parseable by the fuzzer.
+ */
+static void print_kcov_data(unsigned long coverage_count) {
+// --- CHANGE 1: Added conditional compilation block ---
+#ifdef DISABLE_KCOV
+    return; // Do nothing
+#endif
+
+    if (!kcov_available || kcov_cover == NULL || coverage_count == 0) {
+        return;
+    }
+
+    // Sanity check: ensure count doesn't exceed buffer size
+    // (kcov_cover[0] is count, so max index is coverage_count)
+    if (coverage_count >= KCOV_COVER_SIZE) {
+        coverage_count = KCOV_COVER_SIZE - 1;
+    }
+
+    // Print the header for our regex
+    printf(" pc_data=");
+    
+    // Loop from 1 (index 0 is the count itself)
+    for (unsigned long i = 1; i <= coverage_count; i++) {
+        // Print PC address in hex, comma-separated
+        printf("0x%lx%s", kcov_cover[i], (i == coverage_count) ? "" : ",");
+    }
 }
 
 // ============================================================================
@@ -182,6 +228,11 @@ static void timeout_handler(int signum) {
     fprintf(stderr, "Timeout: syscall took too long\n");
     _exit(124);  // Special exit code for timeout
 }
+
+// ============================================================================
+// SYSCALL NAME TO NUMBER MAPPING (TRUNCATED FOR BREVITY)
+// ============================================================================
+
 
 // ============================================================================
 // SYSCALL NAME TO NUMBER MAPPING (COMPLETE)
@@ -953,13 +1004,13 @@ static long resolve_syscall(const char *name) {
     // Syscall not found
     return -1;
 }
-
 // ============================================================================
 // MAIN EXECUTION
 // ============================================================================
 
 int main(int argc, char *argv[]) {
     // Initialize KCOV for coverage tracking
+    // This will do nothing if compiled with -DDISABLE_KCOV
     init_kcov();
 
     // Validate command-line arguments
@@ -998,12 +1049,9 @@ int main(int argc, char *argv[]) {
     alarm(MAX_CPU_SECONDS);
 
     // Print what we're about to execute (for logging)
-    printf("Fuzzing attempt: %s(", syscall_name);
-    for (int i = 0; i < num_args; i++) {
-        printf("0x%lx%s", args[i], (i == num_args - 1) ? "" : ", ");
-    }
-    printf(")\n");
-    fflush(stdout);
+    // Note: This is simplified, your fuzzer_config.py already prints this
+    // printf("Fuzzing attempt: %s(...)\n", syscall_name);
+    // fflush(stdout);
 
     // Enable KCOV coverage collection
     kcov_enable();
@@ -1024,18 +1072,27 @@ int main(int argc, char *argv[]) {
     // Cancel the timeout alarm
     alarm(0);
 
+    // --- CHANGE 3: Modified final printf block ---
+    
     // Print result in parseable format for the fuzzer
+    // Format: syscall(num) = ret (errno=... coverage=count pc_data=0x...,0x...)
+    
     printf("syscall(%ld) = %ld", syscall_num, ret);
     
     if (ret == -1 && saved_errno != 0) {
         // Syscall failed - include errno for analysis
-        printf(" (errno=%d: %s, coverage=%lu)", saved_errno, strerror(saved_errno), coverage_count);
+        printf(" (errno=%d: %s, coverage=%lu", saved_errno, strerror(saved_errno), coverage_count);
     } else {
         // Syscall succeeded or returned non-error value
-        printf(" (coverage=%lu)", coverage_count);
+        printf(" (coverage=%lu", coverage_count);
     }
     
-    printf("\n");
+    // Call the new function to print the PC data
+    // This will append " pc_data=0x...,0x..." if KCOV is enabled
+    print_kcov_data(coverage_count);
+    
+    // Close the parenthesis
+    printf(")\n");
     fflush(stdout);
 
     return 0;

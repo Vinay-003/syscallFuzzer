@@ -196,3 +196,5 @@ python3 fuzzer_config.py
 ```
 
 The fuzzer will start, and you will see output as it discovers new kernel code paths, saving the interesting inputs to the `corpus` directory.
+
+simple_metrics.py is used for testing 
